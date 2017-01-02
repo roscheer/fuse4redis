@@ -40,7 +40,7 @@
 // Redis connection
 redisContext *redisCtx;
 
-// Removes path from file name
+// Strips path from file name
 // TODO: right now this simple macro suffices since we do not support subfolders 
 //       in fuse4redis. Needs to be revisited if folder support is added
 #define FILE_NAME(path) (path[0] == '/' ? path + 1 : path)
@@ -69,13 +69,18 @@ void kvs_init( const char *hostname, int port)
     }
 }
 
+// Connects to redis. Simply aborts if fail.
+void kvs_Cleanup( void)
+{
+    redisFree(redisCtx);
+}
 
 // Creates an empty redis key to represent an empty file
-int kvs_CreateEmptyKey( const char *path)
+int kvs_CreateEmptyKey( const char *name)
 {
     redisReply *reply;
     
-    reply = redisCommand(redisCtx,"SET %s %s", FILE_NAME(path), "");
+    reply = redisCommand(redisCtx,"SET %s %s", name, "");
     if (reply->type == REDIS_REPLY_ERROR) {
         log_msg( "Unexpected result from redis %d\n", reply->type);
         freeReplyObject(reply);
@@ -88,11 +93,11 @@ int kvs_CreateEmptyKey( const char *path)
 
 
 // Checks if a key (representing a file) already exists
-int kvs_KeyExists( const char *path)
+int kvs_KeyExists( const char *name)
 {
     redisReply *reply;
 
-    reply = redisCommand(redisCtx,"EXISTS %s", FILE_NAME(path) );
+    reply = redisCommand(redisCtx,"EXISTS %s", name);
     if (reply->type != REDIS_REPLY_INTEGER) {
         log_msg( "Unexpected result from redis %d\n", reply->type);
         freeReplyObject(reply);
@@ -102,13 +107,50 @@ int kvs_KeyExists( const char *path)
     return (int) reply->integer;  // 1 if exists, 0 otherwise
 }
 
+// Delete key from KVS
+int kvs_DeleteKey( const char *name)
+{
+    redisReply *reply;
+
+    reply = redisCommand(redisCtx,"DEL %s", name);
+    if (reply->type != REDIS_REPLY_INTEGER) {
+        log_msg( "Unexpected result from redis %d\n", reply->type);
+        freeReplyObject(reply);
+        return -EIO;
+    }
+    
+    if ( reply->integer == 0)  // 1 if key existed, 0 otherwise
+        return -ENOENT;
+    return 0;
+}
+
+// Rename key in KVS
+int kvs_RenameKey( const char *name, const char *newname)
+{
+    redisReply *reply;
+
+    reply = redisCommand(redisCtx,"RENAME %s %s", name, newname);
+    if (reply->type == REDIS_REPLY_ERROR) {
+        log_msg( "Error result from redis %d\n", reply->type);
+        freeReplyObject(reply);
+        return -ENOENT;
+    }
+    
+    return 0;
+}
+
+
 // Get length of a key (known to exist, if not redis returns len=0)
-size_t kvs_GetKeyLength( const char *path)
+size_t kvs_GetKeyLength( const char *name)
 {
     redisReply *reply;
     size_t ksize;
     
-    reply = redisCommand(redisCtx,"STRLEN %s", FILE_NAME(path) );
+    // Redis return length 0 for nonexisting keys, so explicitly check
+    if ( ! kvs_KeyExists( name))
+        return -ENOENT;
+        
+    reply = redisCommand(redisCtx,"STRLEN %s", name);
     if (reply->type != REDIS_REPLY_INTEGER) {
         log_msg( "Unexpected result from redis %d\n", reply->type);
         freeReplyObject(reply);
@@ -120,7 +162,7 @@ size_t kvs_GetKeyLength( const char *path)
 }
 
 // Extends the value of an existing key (must exist) using null characters.
-int kvs_AppendZeroedBytes( const char *path, size_t newsize)
+int kvs_AppendZeroedBytes( const char *name, size_t newsize)
 {
     redisReply *reply;
     char zbuffer[512] = {0};
@@ -129,7 +171,7 @@ int kvs_AppendZeroedBytes( const char *path, size_t newsize)
     // Extending a key' value is really a corner case, so no concerns about performance
     while ( newsize > 0) {
         chunksize = newsize > 512 ? 512 : newsize;
-        reply = redisCommand(redisCtx,"APPEND %s %b", FILE_NAME(path), zbuffer, 
+        reply = redisCommand(redisCtx,"APPEND %s %b", name, zbuffer, 
                              chunksize);
         if (reply->type != REDIS_REPLY_INTEGER) {
             log_msg( "Unexpected result from redis %d\n", reply->type);
@@ -143,18 +185,18 @@ int kvs_AppendZeroedBytes( const char *path, size_t newsize)
 }
 
 // Truncates the value of an existing key discarding the trailing content
-int kvs_TruncateKey( const char *path, size_t newsize)
+int kvs_TruncateKey( const char *name, size_t newsize)
 {
     redisReply *reply1, *reply2;
     int result = 0;
 
-    reply1 = redisCommand(redisCtx,"GET %s", FILE_NAME(path));
+    reply1 = redisCommand(redisCtx,"GET %s", name);
     if (reply1->type != REDIS_REPLY_STRING) {
         log_msg( "Unexpected result from redis %d\n", reply1->type);
         freeReplyObject(reply1);
         return -EIO;
     }
-    reply2 = redisCommand( redisCtx, "SET %s %b", FILE_NAME(path), reply1->str, newsize);
+    reply2 = redisCommand( redisCtx, "SET %s %b", name, reply1->str, newsize);
     if ( reply2->type == REDIS_REPLY_ERROR) {
         log_msg( "Error result from redis %d\n", reply2->type);
         result = -EIO;
@@ -164,9 +206,6 @@ int kvs_TruncateKey( const char *path, size_t newsize)
     return result;
 }
 
-    int retstat = 0;
-    redisReply *reply;
-
     
 // This will copy the root directory file list into the FUSE buffer using the FUSE 
 // 'filler' function.
@@ -174,7 +213,7 @@ int kvs_TruncateKey( const char *path, size_t newsize)
 // TODO: Passing the FUSE filler function to this KVS abstraction layer decouples  
 //       the FUSE code from redis, but not vice versa. Ideally this abstraction layer 
 //       would simply return a list off strings (entries), and the calling code would 
-//       transfer them to fuse. However this incurs a penalty allocating space for a 
+//       transfer them to FUSE. However this incurs a penalty allocating space for a 
 //       variable size list and deallocating it soon after. The implementation below
 //       represents an acceptable compromise, given the purpose of this program.
 //
@@ -207,6 +246,46 @@ int kvs_ReadDirectory( void *buf, fuse_fill_dir_t filler)
     return 0;
 }
 
+// Reads the partial contents of a key starting at offset
+int kvs_ReadPartialValue(const char *keyname, char *buf, size_t size, off_t offset)
+{
+    redisReply *reply;
+  
+    // Redis has command to get substrings, which is handy!
+    reply = redisCommand(redisCtx,"GETRANGE %s %ld %ld", keyname,
+                         offset, offset + size - 1);  // Assuming size will never be 0
+    if (reply->type != REDIS_REPLY_STRING) {
+        log_msg( "Unexpected result from redis %d\n", reply->type);
+        freeReplyObject(reply);
+        return -EIO;
+    }
+    
+    memcpy( buf, reply->str, reply->len);
+    
+    return reply->len;
+}
+
+// Writes/overwrites the partial contents of a kye starting at offset
+int kvs_WritePartialValue(const char *keyname, const char *buf, size_t size, off_t offset)
+{
+    redisReply *reply;
+  
+    // Redis has a command to write partial values of keys, which is handy!
+    // Impressively, redis handles writes beyond the current length as expected, 
+    // including filling with zeroes when offset is beyond current length. In a nutshell,
+    // it already implements the same semantics a the write call in Linux. Nice!!!
+    reply = redisCommand(redisCtx,"SETRANGE %s %ld %b", keyname,
+                         offset, buf, size);
+    // However, different from write, redis returns the resulting total length of the key.
+    if (reply->type != REDIS_REPLY_INTEGER) {
+        log_msg( "Unexpected result from redis %d\n", reply->type);
+        freeReplyObject(reply);
+        return -EIO;
+    }
+    
+    return size; // Success: return number of bytes written.
+}
+
 
 //
 // End of section that abstracts database (KVS) details
@@ -214,20 +293,6 @@ int kvs_ReadDirectory( void *buf, fuse_fill_dir_t filler)
 //////////////////////////////////////////////////////////////////////
 
 
-//  All the paths I see are relative to the root of the mounted
-//  filesystem.  In order to get to the underlying filesystem, I need to
-//  have the mountpoint.  I'll save it away early on in main(), and then
-//  whenever I need a path for something I'll call this to construct
-//  it.
-static void f4r_fullpath(char fpath[PATH_MAX], const char *path)
-{
-    strcpy(fpath, F4R_DATA->rootdir);
-    strncat(fpath, path, PATH_MAX); // ridiculously long paths will
-				    // break here
-
-    log_msg("    f4r_fullpath:  rootdir = \"%s\", path = \"%s\", fpath = \"%s\"\n",
-	    F4R_DATA->rootdir, path, fpath);
-}
 
 ///////////////////////////////////////////////////////////
 //
@@ -243,6 +308,7 @@ static void f4r_fullpath(char fpath[PATH_MAX], const char *path)
 int f4r_getattr(const char *path, struct stat *statbuf)
 {
     size_t fsize = 0;
+    const char *filename = FILE_NAME(path);
     
     log_msg( "Called getattr for path=%s\n", path);
     
@@ -252,7 +318,7 @@ int f4r_getattr(const char *path, struct stat *statbuf)
         statbuf->st_size = 0;
     } else {
         // First check if file/key exists, because STRLEN simply returns 0 if it doesn't
-        int exists = kvs_KeyExists( path);
+        int exists = kvs_KeyExists( filename);
         
         if (exists < 0 )
             return -EIO;
@@ -261,7 +327,7 @@ int f4r_getattr(const char *path, struct stat *statbuf)
             return -ENOENT;
 
         statbuf->st_mode = statbuf->st_mode | S_IFREG;
-        fsize = kvs_GetKeyLength( path);
+        fsize = kvs_GetKeyLength( filename);
         if ( fsize < 0 )
             return -EIO;
         log_msg( "File size is %ld\n", fsize);
@@ -288,20 +354,9 @@ int f4r_getattr(const char *path, struct stat *statbuf)
 // f4r_readlink() code by Bernardo F Costa (thanks!)
 int f4r_readlink(const char *path, char *link, size_t size)
 {
-    int retstat;
-    char fpath[PATH_MAX];
+    log_msg( "Called readlink for path=%s\n", path);
     
-    log_msg("f4r_readlink(path=\"%s\", link=\"%s\", size=%d)\n",
-	  path, link, size);
-    f4r_fullpath(fpath, path);
-
-    retstat = log_syscall("fpath", readlink(fpath, link, size - 1), 0);
-    if (retstat >= 0) {
-	link[retstat] = '\0';
-	retstat = 0;
-    }
-    
-    return retstat;
+    return -ENOSYS;     // Not supported
 }
 
 /** Create a file node
@@ -311,6 +366,7 @@ int f4r_readlink(const char *path, char *link, size_t size)
  */
 int f4r_mknod(const char *path, mode_t mode, dev_t dev)
 {
+    const char *filename = FILE_NAME(path);
     
     log_msg( "Called mknod for path=%s\n", path);
     
@@ -319,7 +375,7 @@ int f4r_mknod(const char *path, mode_t mode, dev_t dev)
         
     // With O_EXCL, file/key cannot already exist 
     if (mode & O_EXCL) {
-        int exists = kvs_KeyExists(path);
+        int exists = kvs_KeyExists( filename);
         
         if (exists < 0)
             return -EIO;
@@ -329,7 +385,7 @@ int f4r_mknod(const char *path, mode_t mode, dev_t dev)
     }
     
     // Create an empty redis key to represent an empty file
-    if (kvs_CreateEmptyKey(path) < 0)
+    if (kvs_CreateEmptyKey( filename) < 0)
         return -EIO;
  
     return 0;
@@ -344,16 +400,14 @@ int f4r_mkdir(const char *path, mode_t mode)
 
 /** Remove a file */
 int f4r_unlink(const char *path)
-{
-    char fpath[PATH_MAX];
-    
-    // redis DEL key
-    
+{    
     log_msg( "Called unlink for path=%s\n", path);
 
-    f4r_fullpath(fpath, path);
+    if (strcmp(path, "/") == 0) {   // Trying to delete the FS' root dir
+        return -EISDIR;
+    }
 
-    return log_syscall("unlink", unlink(fpath), 0);
+    return kvs_DeleteKey( FILE_NAME(path));
 }
 
 /** Remove a directory */
@@ -367,12 +421,11 @@ int f4r_rmdir(const char *path)
 
 /** Create a symbolic link */
 // The parameters here are a little bit confusing, but do correspond
-// to the symlink() system call.  The 'path' is where the link points,
-// while the 'link' is the link itself.  So we need to leave the path
-// unaltered, but insert the link into the mounted directory.
+// to the symlink() system call.
 int f4r_symlink(const char *path, const char *link)
 {
     log_msg( "Called symlink for path=%s\n", path);
+    
     return -ENOSYS;
 }
 
@@ -380,24 +433,24 @@ int f4r_symlink(const char *path, const char *link)
 // both path and newpath are fs-relative
 int f4r_rename(const char *path, const char *newpath)
 {
-    char fpath[PATH_MAX];
-    char fnewpath[PATH_MAX];
-    
-    // redis RENAME key newkey
-    // EXISTS key
+    const char *filename = FILE_NAME(path),
+               *newname = FILE_NAME(newpath);
     
     log_msg( "Called rename for path=%s newpath=%s\n", path, newpath);
     
-    f4r_fullpath(fpath, path);
-    f4r_fullpath(fnewpath, newpath);
+    // Some KVS may blindly replace existing keys, so we check if pre-exists
+    // Redis does blindly replace!
+    if ( kvs_KeyExists( newname) )
+        return -EEXIST;
 
-    return log_syscall("rename", rename(fpath, fnewpath), 0);
+    return kvs_RenameKey( filename, newname);
 }
 
 /** Create a hard link to a file */
 int f4r_link(const char *path, const char *newpath)
 {
     log_msg( "Called link for path=%s\n", path);
+    
     return -ENOSYS;
 }
 
@@ -418,29 +471,22 @@ int f4r_chown(const char *path, uid_t uid, gid_t gid)
 /** Change the size of a file */
 int f4r_truncate(const char *path, off_t newsize)
 {
-    int exists, result;
     size_t ksize;
+    const char *filename = FILE_NAME( path);
+    
     log_msg( "Called truncate for path=%s\n", path);
     
-    exists = kvs_KeyExists( path);
-    if ( exists < 0)
-        return -EIO;
-    if ( ! exists)
-        return -ENOENT;
-        
-    ksize = kvs_GetKeyLength( path);
+    ksize = kvs_GetKeyLength( filename);
     if ( ksize < 0)
-        return -EIO;
+        return ksize;
         
     if ( ksize == newsize)
         return 0;       // Nothing to be done
     
     if ( newsize > ksize)
-        result = kvs_AppendZeroedBytes( path, newsize - ksize);
+        return kvs_AppendZeroedBytes( filename, newsize - ksize);
     else
-        result = kvs_TruncateKey( path, newsize);
-     
-    return result;
+        return kvs_TruncateKey( filename, newsize);
 }
 
 /** Change the access and/or modification times of a file */
@@ -463,6 +509,7 @@ int f4r_utime(const char *path, struct utimbuf *ubuf)
 int f4r_open(const char *path, struct fuse_file_info *fi)
 {
     int exists;
+    const char *filename = FILE_NAME( path);
     
     log_msg( "Called open for path=%s\n", path);
     
@@ -470,14 +517,14 @@ int f4r_open(const char *path, struct fuse_file_info *fi)
         return -EISDIR;
     }
     
-    exists = kvs_KeyExists(path);
+    exists = kvs_KeyExists( filename);
     if ( exists < 0)
         return -EIO;
 
     if ( ! exists) {
         if( fi->flags & O_CREAT) {
             // Create an empty redis key to represent an empty file
-            if (kvs_CreateEmptyKey(path) < 0)
+            if (kvs_CreateEmptyKey( filename) < 0)
                 return -EIO;
         } else        
             return -ENOENT;
@@ -499,25 +546,13 @@ int f4r_open(const char *path, struct fuse_file_info *fi)
  */
 int f4r_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-    redisReply *reply;
-    
     log_msg( "Called read for path=%s\n", path);
     
     if (strcmp(path, "/") == 0) {   // Trying to read the FS' root dir
         return -EISDIR;
     }
-    
-    reply = redisCommand(redisCtx,"GETRANGE %s %ld %ld", FILE_NAME(path),
-                         offset, offset + size - 1);  // Assuming size will never be 0
-    if (reply->type != REDIS_REPLY_STRING) {
-        log_msg( "Unexpected result from redis %d\n", reply->type);
-        freeReplyObject(reply);
-        return -EIO;
-    }
-    
-    memcpy( buf, reply->str, reply->len);
-    
-    return reply->len;
+        
+    return kvs_ReadPartialValue(FILE_NAME(path), buf, size, offset);
 }
 
 /** Write data to an open file
@@ -532,8 +567,12 @@ int f4r_write(const char *path, const char *buf, size_t size, off_t offset,
 	     struct fuse_file_info *fi)
 {
     log_msg( "Called writefor path=%s\n", path);
+
+    if (strcmp(path, "/") == 0) {   // Trying to read the FS' root dir
+        return -EISDIR;
+    }
     
-    return log_syscall("pwrite", pwrite(fi->fh, buf, size, offset), 0);
+    return kvs_WritePartialValue( FILE_NAME(path), buf, size, offset);
 }
 
 /** Get file system statistics
@@ -575,7 +614,8 @@ int f4r_statfs(const char *path, struct statvfs *statv)
 int f4r_flush(const char *path, struct fuse_file_info *fi)
 {
     log_msg( "Called flushfor path=%s\n", path);
-    return 0;   // No op. Nothing to flush to redis.
+    
+    return 0;   // No op. Nothing to flush to KVS.
 }
 
 /** Release an open file
@@ -652,12 +692,14 @@ int f4r_removexattr(const char *path, const char *name)
  */
 int f4r_opendir(const char *path, struct fuse_file_info *fi)
 {
-    int retstat = 0;
-    
     log_msg( "Called opendir for path=%s\n", path);
     
-    fi->fh = 0;  // No handles used 
-    return retstat;
+    if (strcmp(path, "/") != 0) {   // Trying to open dir other than FS' root dir
+        return -ENOTDIR;
+    }
+
+    // No handles maintained for root dir. Nothing to do. 
+    return 0;
 }
 
 /** Read directory
@@ -701,7 +743,7 @@ int f4r_releasedir(const char *path, struct fuse_file_info *fi)
 {
     log_msg( "Called releasedir for path=%s\n", path);
     
-    // We do not keep any directory related state and do not use handles. Nothing to do here!
+    // We do not keep any oopen directory related state. Nothing to do here!
     return 0;
 }
 
@@ -754,6 +796,8 @@ void *f4r_init(struct fuse_conn_info *conn)
 void f4r_destroy(void *userdata)
 {
     log_msg( "Called destroy (a.k.a. cleanup)\n");
+    
+    kvs_Cleanup();
 }
 
 /**
@@ -803,7 +847,9 @@ int f4r_access(const char *path, int mask)
 int f4r_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi)
 {
     log_msg( "Called ftruncate for path=%s\n", path);
-    return -ENOSYS;
+    
+    // Since we have the path and do not use handles, ftruncate and truncate are equal
+    return f4r_truncate( FILE_NAME( path), offset);
 }
 
 /**
@@ -823,7 +869,7 @@ int f4r_fgetattr(const char *path, struct stat *statbuf, struct fuse_file_info *
     log_msg( "Called fgetattr for path=%s\n", path);
 
     // Since we do not keep file handles, we simply delegate to f4r_getattr()
-    return f4r_getattr(path, statbuf);
+    return f4r_getattr( FILE_NAME( path), statbuf);
 }
 
 struct fuse_operations f4r_oper = {
@@ -869,12 +915,6 @@ struct fuse_operations f4r_oper = {
   .fgetattr = f4r_fgetattr
 };
 
-void f4r_usage()
-{
-    fprintf(stderr, "usage:  bbfs [FUSE and mount options] rootDir mountPoint\n");
-    abort();
-}
-
 
 int main(int argc, char *argv[])
 {
@@ -890,11 +930,13 @@ int main(int argc, char *argv[])
     // Perform some sanity checking on the command line:  make sure
     // there are enough arguments, and that mount folder does not
     // start with a hyphen (this will break if you actually have a
-    // mountpoint whose name starts with a hyphen, but so will a 
+    // mountpoint whose name starts with a hyphen, but so will 
     // other programs too)
-    if ((argc < 2) || (argv[argc-1][0] == '-'))
-	f4r_usage();
-	
+    if ((argc < 2) || (argv[argc-1][0] == '-')) {
+        fprintf(stderr, "usage:  fuse4redis [FUSE and mount options] mountPoint\n");
+        exit( -1);
+    }
+ 	
     f4r_data = malloc(sizeof(struct f4r_state));
     if (f4r_data == NULL) {
         perror("main calloc");
@@ -908,12 +950,7 @@ int main(int argc, char *argv[])
     
     // turn over control to fuse
     
-    fprintf(stderr, "Calling fuse_main()\n");
-
     fuse_stat = fuse_main(argc, argv, &f4r_oper, f4r_data);
     
-    log_msg( "Returned from fuse_main() status=%d\n", fuse_stat);
-    
-    redisFree(redisCtx);
     return fuse_stat;
 }
