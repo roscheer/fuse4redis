@@ -4,3 +4,6 @@ The part of the code that interacts with redis is clearly separate from the code
 
 Since this is useful for educational purposes only, not much efoort was put on performance. Not all file system functionality is implemented, either.
 
+The code is based on the FUSE tutoria created by Joseph J. Pfeiffer, Jr. (http://www.cs.nmsu.edu/~pfeiffer/fuse-tutorial/). Most of the code was changed, however. Only the FUSE callbacks prototypes, and the logging functionality, are actually being reused.
+
+
