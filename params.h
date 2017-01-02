@@ -20,13 +20,13 @@
 // setlinebuf() later in consequence.
 #define _XOPEN_SOURCE 500
 
-// maintain bbfs state in here
+// maintain fuse4redis state in here
 #include <limits.h>
 #include <stdio.h>
-struct bb_state {
+struct f4r_state {
     FILE *logfile;
     char *rootdir;
 };
-#define BB_DATA ((struct bb_state *) fuse_get_context()->private_data)
+#define F4R_DATA ((struct f4r_state *) fuse_get_context()->private_data)
 
 #endif

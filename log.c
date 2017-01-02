@@ -1,5 +1,8 @@
 /*
   Copyright (C) 2012 Joseph J. Pfeiffer, Jr., Ph.D. <pfeiffer@cs.nmsu.edu>
+  Copyright (C) 2016 Roque Scheer
+  
+  Just modified the name from bbfs to fuse4redis
 
   This program can be distributed under the terms of the GNU GPLv3.
   See the file COPYING.
@@ -31,7 +34,7 @@ FILE *log_open()
     
     // very first thing, open up the logfile and mark that we got in
     // here.  If we can't open the logfile, we're dead.
-    logfile = fopen("bbfs.log", "w");
+    logfile = fopen("fuse4redis.log", "w");
     if (logfile == NULL) {
 	perror("logfile");
 	exit(EXIT_FAILURE);
@@ -48,7 +51,7 @@ void log_msg(const char *format, ...)
     va_list ap;
     va_start(ap, format);
 
-    vfprintf(BB_DATA->logfile, format, ap);
+    vfprintf(F4R_DATA->logfile, format, ap);
 }
 
 // Report errors to logfile and give -errno to caller
@@ -85,8 +88,8 @@ void log_fuse_context(struct fuse_context *context)
     /** Private filesystem data */
     //	void *private_data;
     log_struct(context, private_data, %08x, );
-    log_struct(((struct bb_state *)context->private_data), logfile, %08x, );
-    log_struct(((struct bb_state *)context->private_data), rootdir, %s, );
+    log_struct(((struct f4r_state *)context->private_data), logfile, %08x, );
+    log_struct(((struct f4r_state *)context->private_data), rootdir, %s, );
 	
     /** Umask of the calling process (introduced in version 2.8) */
     //	mode_t umask;
@@ -95,7 +98,7 @@ void log_fuse_context(struct fuse_context *context)
 
 // struct fuse_conn_info contains information about the socket
 // connection being used.  I don't actually use any of this
-// information in bbfs
+// information in fuse4redis
 void log_conn(struct fuse_conn_info *conn)
 {
     log_msg("    conn:\n");

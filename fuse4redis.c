@@ -46,10 +46,14 @@ redisContext *redisCtx;
 #define FILE_NAME(path) (path[0] == '/' ? path + 1 : path)
 
 
+//////////////////////////////////////////////////////////////////////
+//
 // Ancilary functions to abstract database (KVS) details
+//
+// TODO: Move these functions to a separate source code file
 
 // Connects to redis. Simply aborts if fail.
-void redis_init( const char *hostname, int port)
+void kvs_init( const char *hostname, int port)
 {
     struct timeval timeout = { 1, 500000 }; // 1.5 seconds
     
@@ -67,7 +71,7 @@ void redis_init( const char *hostname, int port)
 
 
 // Creates an empty redis key to represent an empty file
-int redis_CreateEmptyKey( const char *path)
+int kvs_CreateEmptyKey( const char *path)
 {
     redisReply *reply;
     
@@ -84,7 +88,7 @@ int redis_CreateEmptyKey( const char *path)
 
 
 // Checks if a key (representing a file) already exists
-int redis_KeyExists( const char *path)
+int kvs_KeyExists( const char *path)
 {
     redisReply *reply;
 
@@ -99,7 +103,7 @@ int redis_KeyExists( const char *path)
 }
 
 // Get length of a key (known to exist, if not redis returns len=0)
-size_t redis_GetKeyLength( const char *path)
+size_t kvs_GetKeyLength( const char *path)
 {
     redisReply *reply;
     size_t ksize;
@@ -116,7 +120,7 @@ size_t redis_GetKeyLength( const char *path)
 }
 
 // Extends the value of an existing key (must exist) using null characters.
-int redis_AppendZeroedBytes( const char *path, size_t newsize)
+int kvs_AppendZeroedBytes( const char *path, size_t newsize)
 {
     redisReply *reply;
     char zbuffer[512] = {0};
@@ -139,7 +143,7 @@ int redis_AppendZeroedBytes( const char *path, size_t newsize)
 }
 
 // Truncates the value of an existing key discarding the trailing content
-int redis_TruncateKey( const char *path, size_t newsize)
+int kvs_TruncateKey( const char *path, size_t newsize)
 {
     redisReply *reply1, *reply2;
     int result = 0;
@@ -176,7 +180,7 @@ int redis_TruncateKey( const char *path, size_t newsize)
 //
 // TODO: Function is not ready template is not ready to support subfolders eventually.
 //
-int redis_ReadDirectory( void *buf, fuse_fill_dir_t filler)
+int kvs_ReadDirectory( void *buf, fuse_fill_dir_t filler)
 {
     redisReply *reply;
       
@@ -193,7 +197,7 @@ int redis_ReadDirectory( void *buf, fuse_fill_dir_t filler)
         for (int j = 0; j < reply->elements; j++) {
             log_msg("calling filler with name %s\n", reply->element[j]->str);
             if (filler(buf, reply->element[j]->str, NULL, 0) != 0) {
-	        log_msg("    ERROR bb_readdir filler:  buffer full");
+	        log_msg("    ERROR f4r_readdir filler:  buffer full");
                 freeReplyObject(reply);
 	        return -ENOMEM;
 	    }
@@ -204,19 +208,25 @@ int redis_ReadDirectory( void *buf, fuse_fill_dir_t filler)
 }
 
 
+//
+// End of section that abstracts database (KVS) details
+//
+//////////////////////////////////////////////////////////////////////
+
+
 //  All the paths I see are relative to the root of the mounted
 //  filesystem.  In order to get to the underlying filesystem, I need to
 //  have the mountpoint.  I'll save it away early on in main(), and then
 //  whenever I need a path for something I'll call this to construct
 //  it.
-static void bb_fullpath(char fpath[PATH_MAX], const char *path)
+static void f4r_fullpath(char fpath[PATH_MAX], const char *path)
 {
-    strcpy(fpath, BB_DATA->rootdir);
+    strcpy(fpath, F4R_DATA->rootdir);
     strncat(fpath, path, PATH_MAX); // ridiculously long paths will
 				    // break here
 
-    log_msg("    bb_fullpath:  rootdir = \"%s\", path = \"%s\", fpath = \"%s\"\n",
-	    BB_DATA->rootdir, path, fpath);
+    log_msg("    f4r_fullpath:  rootdir = \"%s\", path = \"%s\", fpath = \"%s\"\n",
+	    F4R_DATA->rootdir, path, fpath);
 }
 
 ///////////////////////////////////////////////////////////
@@ -230,7 +240,7 @@ static void bb_fullpath(char fpath[PATH_MAX], const char *path)
  * ignored.  The 'st_ino' field is ignored except if the 'use_ino'
  * mount option is given.
  */
-int bb_getattr(const char *path, struct stat *statbuf)
+int f4r_getattr(const char *path, struct stat *statbuf)
 {
     size_t fsize = 0;
     
@@ -242,7 +252,7 @@ int bb_getattr(const char *path, struct stat *statbuf)
         statbuf->st_size = 0;
     } else {
         // First check if file/key exists, because STRLEN simply returns 0 if it doesn't
-        int exists = redis_KeyExists( path);
+        int exists = kvs_KeyExists( path);
         
         if (exists < 0 )
             return -EIO;
@@ -251,7 +261,7 @@ int bb_getattr(const char *path, struct stat *statbuf)
             return -ENOENT;
 
         statbuf->st_mode = statbuf->st_mode | S_IFREG;
-        fsize = redis_GetKeyLength( path);
+        fsize = kvs_GetKeyLength( path);
         if ( fsize < 0 )
             return -EIO;
         log_msg( "File size is %ld\n", fsize);
@@ -274,16 +284,16 @@ int bb_getattr(const char *path, struct stat *statbuf)
  */
 // Note the system readlink() will truncate and lose the terminating
 // null.  So, the size passed to to the system readlink() must be one
-// less than the size passed to bb_readlink()
-// bb_readlink() code by Bernardo F Costa (thanks!)
-int bb_readlink(const char *path, char *link, size_t size)
+// less than the size passed to f4r_readlink()
+// f4r_readlink() code by Bernardo F Costa (thanks!)
+int f4r_readlink(const char *path, char *link, size_t size)
 {
     int retstat;
     char fpath[PATH_MAX];
     
-    log_msg("bb_readlink(path=\"%s\", link=\"%s\", size=%d)\n",
+    log_msg("f4r_readlink(path=\"%s\", link=\"%s\", size=%d)\n",
 	  path, link, size);
-    bb_fullpath(fpath, path);
+    f4r_fullpath(fpath, path);
 
     retstat = log_syscall("fpath", readlink(fpath, link, size - 1), 0);
     if (retstat >= 0) {
@@ -299,7 +309,7 @@ int bb_readlink(const char *path, char *link, size_t size)
  * There is no create() operation, mknod() will be called for
  * creation of all non-directory, non-symlink nodes.
  */
-int bb_mknod(const char *path, mode_t mode, dev_t dev)
+int f4r_mknod(const char *path, mode_t mode, dev_t dev)
 {
     
     log_msg( "Called mknod for path=%s\n", path);
@@ -309,7 +319,7 @@ int bb_mknod(const char *path, mode_t mode, dev_t dev)
         
     // With O_EXCL, file/key cannot already exist 
     if (mode & O_EXCL) {
-        int exists = redis_KeyExists(path);
+        int exists = kvs_KeyExists(path);
         
         if (exists < 0)
             return -EIO;
@@ -319,21 +329,21 @@ int bb_mknod(const char *path, mode_t mode, dev_t dev)
     }
     
     // Create an empty redis key to represent an empty file
-    if (redis_CreateEmptyKey(path) < 0)
+    if (kvs_CreateEmptyKey(path) < 0)
         return -EIO;
  
     return 0;
 }
 
 /** Create a directory */
-int bb_mkdir(const char *path, mode_t mode)
+int f4r_mkdir(const char *path, mode_t mode)
 {
     log_msg( "Called mkdir for path=%s\n", path);
     return -ENOSYS;
 }
 
 /** Remove a file */
-int bb_unlink(const char *path)
+int f4r_unlink(const char *path)
 {
     char fpath[PATH_MAX];
     
@@ -341,13 +351,13 @@ int bb_unlink(const char *path)
     
     log_msg( "Called unlink for path=%s\n", path);
 
-    bb_fullpath(fpath, path);
+    f4r_fullpath(fpath, path);
 
     return log_syscall("unlink", unlink(fpath), 0);
 }
 
 /** Remove a directory */
-int bb_rmdir(const char *path)
+int f4r_rmdir(const char *path)
 {
     log_msg( "Called rmdir for path=%s\n", path);
 
@@ -360,7 +370,7 @@ int bb_rmdir(const char *path)
 // to the symlink() system call.  The 'path' is where the link points,
 // while the 'link' is the link itself.  So we need to leave the path
 // unaltered, but insert the link into the mounted directory.
-int bb_symlink(const char *path, const char *link)
+int f4r_symlink(const char *path, const char *link)
 {
     log_msg( "Called symlink for path=%s\n", path);
     return -ENOSYS;
@@ -368,7 +378,7 @@ int bb_symlink(const char *path, const char *link)
 
 /** Rename a file */
 // both path and newpath are fs-relative
-int bb_rename(const char *path, const char *newpath)
+int f4r_rename(const char *path, const char *newpath)
 {
     char fpath[PATH_MAX];
     char fnewpath[PATH_MAX];
@@ -378,47 +388,47 @@ int bb_rename(const char *path, const char *newpath)
     
     log_msg( "Called rename for path=%s newpath=%s\n", path, newpath);
     
-    bb_fullpath(fpath, path);
-    bb_fullpath(fnewpath, newpath);
+    f4r_fullpath(fpath, path);
+    f4r_fullpath(fnewpath, newpath);
 
     return log_syscall("rename", rename(fpath, fnewpath), 0);
 }
 
 /** Create a hard link to a file */
-int bb_link(const char *path, const char *newpath)
+int f4r_link(const char *path, const char *newpath)
 {
     log_msg( "Called link for path=%s\n", path);
     return -ENOSYS;
 }
 
 /** Change the permission bits of a file */
-int bb_chmod(const char *path, mode_t mode)
+int f4r_chmod(const char *path, mode_t mode)
 {
     log_msg( "Called chmod for path=%s\n", path);
     return -ENOSYS;
 }
 
 /** Change the owner and group of a file */
-int bb_chown(const char *path, uid_t uid, gid_t gid)
+int f4r_chown(const char *path, uid_t uid, gid_t gid)
 {
     log_msg( "Called chown for path=%s\n", path);
     return -ENOSYS;
 }
 
 /** Change the size of a file */
-int bb_truncate(const char *path, off_t newsize)
+int f4r_truncate(const char *path, off_t newsize)
 {
     int exists, result;
     size_t ksize;
     log_msg( "Called truncate for path=%s\n", path);
     
-    exists = redis_KeyExists( path);
+    exists = kvs_KeyExists( path);
     if ( exists < 0)
         return -EIO;
     if ( ! exists)
         return -ENOENT;
         
-    ksize = redis_GetKeyLength( path);
+    ksize = kvs_GetKeyLength( path);
     if ( ksize < 0)
         return -EIO;
         
@@ -426,15 +436,15 @@ int bb_truncate(const char *path, off_t newsize)
         return 0;       // Nothing to be done
     
     if ( newsize > ksize)
-        result = redis_AppendZeroedBytes( path, newsize - ksize);
+        result = kvs_AppendZeroedBytes( path, newsize - ksize);
     else
-        result = redis_TruncateKey( path, newsize);
+        result = kvs_TruncateKey( path, newsize);
      
     return result;
 }
 
 /** Change the access and/or modification times of a file */
-int bb_utime(const char *path, struct utimbuf *ubuf)
+int f4r_utime(const char *path, struct utimbuf *ubuf)
 {
     log_msg( "Called utime for path=%s\n", path);
     return -ENOSYS;
@@ -450,7 +460,7 @@ int bb_utime(const char *path, struct utimbuf *ubuf)
  *
  * Changed in version 2.2
  */
-int bb_open(const char *path, struct fuse_file_info *fi)
+int f4r_open(const char *path, struct fuse_file_info *fi)
 {
     int exists;
     
@@ -460,14 +470,14 @@ int bb_open(const char *path, struct fuse_file_info *fi)
         return -EISDIR;
     }
     
-    exists = redis_KeyExists(path);
+    exists = kvs_KeyExists(path);
     if ( exists < 0)
         return -EIO;
 
     if ( ! exists) {
         if( fi->flags & O_CREAT) {
             // Create an empty redis key to represent an empty file
-            if (redis_CreateEmptyKey(path) < 0)
+            if (kvs_CreateEmptyKey(path) < 0)
                 return -EIO;
         } else        
             return -ENOENT;
@@ -487,7 +497,7 @@ int bb_open(const char *path, struct fuse_file_info *fi)
  *
  * Changed in version 2.2
  */
-int bb_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
+int f4r_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
     redisReply *reply;
     
@@ -518,7 +528,7 @@ int bb_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_
  *
  * Changed in version 2.2
  */
-int bb_write(const char *path, const char *buf, size_t size, off_t offset,
+int f4r_write(const char *path, const char *buf, size_t size, off_t offset,
 	     struct fuse_file_info *fi)
 {
     log_msg( "Called writefor path=%s\n", path);
@@ -533,7 +543,7 @@ int bb_write(const char *path, const char *buf, size_t size, off_t offset,
  * Replaced 'struct statfs' parameter with 'struct statvfs' in
  * version 2.5
  */
-int bb_statfs(const char *path, struct statvfs *statv)
+int f4r_statfs(const char *path, struct statvfs *statv)
 {
     log_msg( "Called statfs for path=%s\n", path);
     return -ENOSYS;
@@ -562,7 +572,7 @@ int bb_statfs(const char *path, struct statvfs *statv)
  *
  * Changed in version 2.2
  */
-int bb_flush(const char *path, struct fuse_file_info *fi)
+int f4r_flush(const char *path, struct fuse_file_info *fi)
 {
     log_msg( "Called flushfor path=%s\n", path);
     return 0;   // No op. Nothing to flush to redis.
@@ -582,7 +592,7 @@ int bb_flush(const char *path, struct fuse_file_info *fi)
  *
  * Changed in version 2.2
  */
-int bb_release(const char *path, struct fuse_file_info *fi)
+int f4r_release(const char *path, struct fuse_file_info *fi)
 {
     log_msg( "Called release for path=%s\n", path);
 
@@ -597,7 +607,7 @@ int bb_release(const char *path, struct fuse_file_info *fi)
  *
  * Changed in version 2.2
  */
-int bb_fsync(const char *path, int datasync, struct fuse_file_info *fi)
+int f4r_fsync(const char *path, int datasync, struct fuse_file_info *fi)
 {
     log_msg( "Called fsync for path=%s\n", path);
     return 0;
@@ -605,28 +615,28 @@ int bb_fsync(const char *path, int datasync, struct fuse_file_info *fi)
 
 #ifdef HAVE_SYS_XATTR_H
 /** Set extended attributes */
-int bb_setxattr(const char *path, const char *name, const char *value, size_t size, int flags)
+int f4r_setxattr(const char *path, const char *name, const char *value, size_t size, int flags)
 {
     log_msg( "Called setxattr for path=%s\n", path);
     return -ENOSYS;
 }
 
 /** Get extended attributes */
-int bb_getxattr(const char *path, const char *name, char *value, size_t size)
+int f4r_getxattr(const char *path, const char *name, char *value, size_t size)
 {
     log_msg( "Called getxattr for path=%s\n", path);
     return -ENOSYS;
 }
 
 /** List extended attributes */
-int bb_listxattr(const char *path, char *list, size_t size)
+int f4r_listxattr(const char *path, char *list, size_t size)
 {
     log_msg( "Called listxattr for path=%s\n", path);
     return -ENOSYS;
 }
 
 /** Remove extended attributes */
-int bb_removexattr(const char *path, const char *name)
+int f4r_removexattr(const char *path, const char *name)
 {
     log_msg( "Called removexattr for path=%s\n", path);
     return -ENOSYS;
@@ -640,7 +650,7 @@ int bb_removexattr(const char *path, const char *name)
  *
  * Introduced in version 2.3
  */
-int bb_opendir(const char *path, struct fuse_file_info *fi)
+int f4r_opendir(const char *path, struct fuse_file_info *fi)
 {
     int retstat = 0;
     
@@ -672,7 +682,7 @@ int bb_opendir(const char *path, struct fuse_file_info *fi)
  * Introduced in version 2.3
  */
 
-int bb_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
+int f4r_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
 	       struct fuse_file_info *fi)
 {
     log_msg( "Called readdir for path=%s\n", path);
@@ -680,14 +690,14 @@ int bb_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset
     if (strcmp(path, "/") != 0)   // Only the FS' root dir is currently allowed
         return -ENOTDIR;
     
-    return redis_ReadDirectory( buf, filler);
+    return kvs_ReadDirectory( buf, filler);
 }
 
 /** Release directory
  *
  * Introduced in version 2.3
  */
-int bb_releasedir(const char *path, struct fuse_file_info *fi)
+int f4r_releasedir(const char *path, struct fuse_file_info *fi)
 {
     log_msg( "Called releasedir for path=%s\n", path);
     
@@ -704,7 +714,7 @@ int bb_releasedir(const char *path, struct fuse_file_info *fi)
  */
 // when exactly is this called?  when a user calls fsync and it
 // happens to be a directory? ??? >>> I need to implement this...
-int bb_fsyncdir(const char *path, int datasync, struct fuse_file_info *fi)
+int f4r_fsyncdir(const char *path, int datasync, struct fuse_file_info *fi)
 {
     log_msg( "Called fsyncdir for path=%s\n", path);
     return 0;
@@ -727,11 +737,11 @@ int bb_fsyncdir(const char *path, int datasync, struct fuse_file_info *fi)
 // parameter coming in here, or else the fact should be documented
 // (and this might as well return void, as it did in older versions of
 // FUSE).
-void *bb_init(struct fuse_conn_info *conn)
+void *f4r_init(struct fuse_conn_info *conn)
 {
     log_msg( "Called init\n");
     
-    return BB_DATA;
+    return F4R_DATA;
 }
 
 /**
@@ -741,7 +751,7 @@ void *bb_init(struct fuse_conn_info *conn)
  *
  * Introduced in version 2.3
  */
-void bb_destroy(void *userdata)
+void f4r_destroy(void *userdata)
 {
     log_msg( "Called destroy (a.k.a. cleanup)\n");
 }
@@ -757,7 +767,7 @@ void bb_destroy(void *userdata)
  *
  * Introduced in version 2.5
  */
-int bb_access(const char *path, int mask)
+int f4r_access(const char *path, int mask)
 {
     log_msg( "Called access for path=%s mask=%d\n", path, mask);
     return 0;
@@ -790,7 +800,7 @@ int bb_access(const char *path, int mask)
  *
  * Introduced in version 2.5
  */
-int bb_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi)
+int f4r_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi)
 {
     log_msg( "Called ftruncate for path=%s\n", path);
     return -ENOSYS;
@@ -808,58 +818,58 @@ int bb_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi)
  *
  * Introduced in version 2.5
  */
-int bb_fgetattr(const char *path, struct stat *statbuf, struct fuse_file_info *fi)
+int f4r_fgetattr(const char *path, struct stat *statbuf, struct fuse_file_info *fi)
 {
     log_msg( "Called fgetattr for path=%s\n", path);
 
-    // Since we do not keep file handles, we simply delegate to bb_getattr()
-    return bb_getattr(path, statbuf);
+    // Since we do not keep file handles, we simply delegate to f4r_getattr()
+    return f4r_getattr(path, statbuf);
 }
 
-struct fuse_operations bb_oper = {
-  .getattr = bb_getattr,
-  .readlink = bb_readlink,
+struct fuse_operations f4r_oper = {
+  .getattr = f4r_getattr,
+  .readlink = f4r_readlink,
   // no .getdir -- that's deprecated
   .getdir = NULL,
-  .mknod = bb_mknod,
-  .mkdir = bb_mkdir,
-  .unlink = bb_unlink,
-  .rmdir = bb_rmdir,
-  .symlink = bb_symlink,
-  .rename = bb_rename,
-  .link = bb_link,
-  .chmod = bb_chmod,
-  .chown = bb_chown,
-  .truncate = bb_truncate,
-  .utime = bb_utime,
-  .open = bb_open,
-  .read = bb_read,
-  .write = bb_write,
+  .mknod = f4r_mknod,
+  .mkdir = f4r_mkdir,
+  .unlink = f4r_unlink,
+  .rmdir = f4r_rmdir,
+  .symlink = f4r_symlink,
+  .rename = f4r_rename,
+  .link = f4r_link,
+  .chmod = f4r_chmod,
+  .chown = f4r_chown,
+  .truncate = f4r_truncate,
+  .utime = f4r_utime,
+  .open = f4r_open,
+  .read = f4r_read,
+  .write = f4r_write,
   /** Just a placeholder, don't set */ // huh???
-  .statfs = bb_statfs,
-  .flush = bb_flush,
-  .release = bb_release,
-  .fsync = bb_fsync,
+  .statfs = f4r_statfs,
+  .flush = f4r_flush,
+  .release = f4r_release,
+  .fsync = f4r_fsync,
   
 #ifdef HAVE_SYS_XATTR_H
-  .setxattr = bb_setxattr,
-  .getxattr = bb_getxattr,
-  .listxattr = bb_listxattr,
-  .removexattr = bb_removexattr,
+  .setxattr = f4r_setxattr,
+  .getxattr = f4r_getxattr,
+  .listxattr = f4r_listxattr,
+  .removexattr = f4r_removexattr,
 #endif
   
-  .opendir = bb_opendir,
-  .readdir = bb_readdir,
-  .releasedir = bb_releasedir,
-  .fsyncdir = bb_fsyncdir,
-  .init = bb_init,
-  .destroy = bb_destroy,
-  .access = bb_access,
-  .ftruncate = bb_ftruncate,
-  .fgetattr = bb_fgetattr
+  .opendir = f4r_opendir,
+  .readdir = f4r_readdir,
+  .releasedir = f4r_releasedir,
+  .fsyncdir = f4r_fsyncdir,
+  .init = f4r_init,
+  .destroy = f4r_destroy,
+  .access = f4r_access,
+  .ftruncate = f4r_ftruncate,
+  .fgetattr = f4r_fgetattr
 };
 
-void bb_usage()
+void f4r_usage()
 {
     fprintf(stderr, "usage:  bbfs [FUSE and mount options] rootDir mountPoint\n");
     abort();
@@ -871,7 +881,7 @@ int main(int argc, char *argv[])
     const char *hostname = "127.0.0.1";
     int port = 6379;
     int fuse_stat;
-    struct bb_state *bb_data;
+    struct f4r_state *f4r_data;
 
 
     // See which version of fuse we're running
@@ -883,24 +893,24 @@ int main(int argc, char *argv[])
     // mountpoint whose name starts with a hyphen, but so will a 
     // other programs too)
     if ((argc < 2) || (argv[argc-1][0] == '-'))
-	bb_usage();
+	f4r_usage();
 	
-    bb_data = malloc(sizeof(struct bb_state));
-    if (bb_data == NULL) {
+    f4r_data = malloc(sizeof(struct f4r_state));
+    if (f4r_data == NULL) {
         perror("main calloc");
         abort();
     }
-    bb_data->logfile = log_open();
+    f4r_data->logfile = log_open();
 
 
-// TODO: implement option to connect to a remote redis host
-    redis_init(hostname, port);
+    // TODO: implement option to connect to a remote redis host
+    kvs_init(hostname, port);
     
     // turn over control to fuse
     
     fprintf(stderr, "Calling fuse_main()\n");
 
-    fuse_stat = fuse_main(argc, argv, &bb_oper, bb_data);
+    fuse_stat = fuse_main(argc, argv, &f4r_oper, f4r_data);
     
     log_msg( "Returned from fuse_main() status=%d\n", fuse_stat);
     
