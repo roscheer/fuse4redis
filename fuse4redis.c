@@ -159,7 +159,50 @@ int redis_TruncateKey( const char *path, size_t newsize)
     freeReplyObject(reply2);
     return result;
 }
-   
+
+    int retstat = 0;
+    redisReply *reply;
+
+    
+// This will copy the root directory file list into the FUSE buffer using the FUSE 
+// 'filler' function.
+//
+// TODO: Passing the FUSE filler function to this KVS abstraction layer decouples  
+//       the FUSE code from redis, but not vice versa. Ideally this abstraction layer 
+//       would simply return a list off strings (entries), and the calling code would 
+//       transfer them to fuse. However this incurs a penalty allocating space for a 
+//       variable size list and deallocating it soon after. The implementation below
+//       represents an acceptable compromise, given the purpose of this program.
+//
+// TODO: Function is not ready template is not ready to support subfolders eventually.
+//
+int redis_ReadDirectory( void *buf, fuse_fill_dir_t filler)
+{
+    redisReply *reply;
+      
+    reply = redisCommand(redisCtx,"KEYS *");
+    if (reply->type == REDIS_REPLY_ERROR) {
+        log_msg( "Failed to communicate with redis\n");
+        return -EIO;
+    }
+        
+   // The loop below exits when either all keys were copied, or filler()
+   // returns something non-zero.  The first case just means I've
+   // read the whole 'redis' directory; the second means the buffer is full.
+    if (reply->type == REDIS_REPLY_ARRAY) {
+        for (int j = 0; j < reply->elements; j++) {
+            log_msg("calling filler with name %s\n", reply->element[j]->str);
+            if (filler(buf, reply->element[j]->str, NULL, 0) != 0) {
+	        log_msg("    ERROR bb_readdir filler:  buffer full");
+                freeReplyObject(reply);
+	        return -ENOMEM;
+	    }
+	}
+    }
+    freeReplyObject(reply);
+    return 0;
+}
+
 
 //  All the paths I see are relative to the root of the mounted
 //  filesystem.  In order to get to the underlying filesystem, I need to
@@ -632,36 +675,12 @@ int bb_opendir(const char *path, struct fuse_file_info *fi)
 int bb_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
 	       struct fuse_file_info *fi)
 {
-    int retstat = 0;
-    redisReply *reply;
-
-    
     log_msg( "Called readdir for path=%s\n", path);
-
-    // This will copy the entire directory into the buffer.  The loop exits
-    // when either all redis keys were copied, or filler()
-    // returns something non-zero.  The first case just means I've
-    // read the whole 'redis' directory; the second means the buffer is full.
-      
-    reply = redisCommand(redisCtx,"KEYS *");
-    if (reply->type == REDIS_REPLY_ERROR) {
-        log_msg( "Failed to communicate with redis\n");
-        return -EIO;
-    }
-        
-    if (reply->type == REDIS_REPLY_ARRAY) {
-        for (int j = 0; j < reply->elements; j++) {
-            log_msg("calling filler with name %s\n", reply->element[j]->str);
-            if (filler(buf, reply->element[j]->str, NULL, 0) != 0) {
-	        log_msg("    ERROR bb_readdir filler:  buffer full");
-                freeReplyObject(reply);
-	        return -ENOMEM;
-	    }
-	}
-    }
-    freeReplyObject(reply);
-        
-    return retstat;
+    
+    if (strcmp(path, "/") != 0)   // Only the FS' root dir is currently allowed
+        return -ENOTDIR;
+    
+    return redis_ReadDirectory( buf, filler);
 }
 
 /** Release directory
