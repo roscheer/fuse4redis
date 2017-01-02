@@ -212,12 +212,17 @@ int kvs_TruncateKey( const char *name, size_t newsize)
 //
 // TODO: Passing the FUSE filler function to this KVS abstraction layer decouples  
 //       the FUSE code from redis, but not vice versa. Ideally this abstraction layer 
-//       would simply return a list off strings (entries), and the calling code would 
+//       would simply return a list of strings (entries), and the calling code would 
 //       transfer them to FUSE. However this incurs a penalty allocating space for a 
 //       variable size list and deallocating it soon after. The implementation below
 //       represents an acceptable compromise, given the purpose of this program.
 //
-// TODO: Function is not ready template is not ready to support subfolders eventually.
+// TODO: Function prototype is not adequate to support subfolders eventually. Root 
+//       folder is implicitly assumed.
+//
+// TODO: Fuse4redis creates only string values. However if keys with other value types 
+//       (e.g. integer) are created using redis-cli, these keys will result in errors 
+//       when accessed.
 //
 int kvs_ReadDirectory( void *buf, fuse_fill_dir_t filler)
 {
