@@ -192,7 +192,7 @@ int kvs_TruncateKey( const char *name, size_t newsize)
     int result = 0;
 
     if ( newsize > 0 ) {    // Need to preserve beginning of value 
-        reply1 = redisCommand(redisCtx,"GETRANGE %s %d %d", name, 0, newsize);
+        reply1 = redisCommand(redisCtx,"GETRANGE %s %ld %ld", name, (size_t)0, newsize);
         if (reply1->type != REDIS_REPLY_STRING) {
             log_msg( "Unexpected result from redis %d\n", reply1->type);
             freeReplyObject(reply1);
@@ -275,7 +275,7 @@ int kvs_ReadPartialValue(const char *keyname, char *buf, size_t size, off_t offs
     return reply->len;
 }
 
-// Writes/overwrites the partial contents of a kye starting at offset
+// Writes/overwrites the partial contents of a key starting at offset
 int kvs_WritePartialValue(const char *keyname, const char *buf, size_t size, off_t offset)
 {
     redisReply *reply;
