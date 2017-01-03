@@ -187,21 +187,26 @@ int kvs_AppendZeroedBytes( const char *name, size_t newsize)
 // Truncates the value of an existing key discarding the trailing content
 int kvs_TruncateKey( const char *name, size_t newsize)
 {
-    redisReply *reply1, *reply2;
+    redisReply *reply1 = NULL,
+               *reply2;
     int result = 0;
 
-    reply1 = redisCommand(redisCtx,"GET %s", name);
-    if (reply1->type != REDIS_REPLY_STRING) {
-        log_msg( "Unexpected result from redis %d\n", reply1->type);
-        freeReplyObject(reply1);
-        return -EIO;
+    if ( newsize > 0 ) {    // Need to preserve beginning of value 
+        reply1 = redisCommand(redisCtx,"GETRANGE %s %d %d", name, 0, newsize);
+        if (reply1->type != REDIS_REPLY_STRING) {
+            log_msg( "Unexpected result from redis %d\n", reply1->type);
+            freeReplyObject(reply1);
+            return -EIO;
+        }
     }
-    reply2 = redisCommand( redisCtx, "SET %s %b", name, reply1->str, newsize);
+    reply2 = redisCommand( redisCtx, "SET %s %b", name, 
+                           newsize > 0 ? reply1->str : "", newsize);
     if ( reply2->type == REDIS_REPLY_ERROR) {
         log_msg( "Error result from redis %d\n", reply2->type);
         result = -EIO;
     }
-    freeReplyObject(reply1);
+    if ( reply1 != NULL)
+        freeReplyObject(reply1);
     freeReplyObject(reply2);
     return result;
 }
@@ -533,7 +538,15 @@ int f4r_open(const char *path, struct fuse_file_info *fi)
                 return -EIO;
         } else        
             return -ENOENT;
+    } else {
+        if( fi->flags & O_TRUNC) {
+            // Empty the file, if existing
+            if (kvs_TruncateKey( filename, 0) < 0)
+                return -EIO;
+        }
     }
+
+    
 
     return 0;
 }
