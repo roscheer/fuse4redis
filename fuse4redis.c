@@ -51,6 +51,8 @@ redisContext *redisCtx;
 // Ancilary functions to abstract database (KVS) details
 //
 // TODO: Move these functions to a separate source code file
+// TODO: Connection to redis may be lost and a reconnection may fix it.
+//       Replace calls to redisCommand by a local function that retries once.
 
 // Connects to redis. Simply aborts if fail.
 void kvs_init( const char *hostname, int port)
@@ -566,7 +568,9 @@ int f4r_read(const char *path, char *buf, size_t size, off_t offset, struct fuse
     if (strcmp(path, "/") == 0) {   // Trying to read the FS' root dir
         return -EISDIR;
     }
-        
+
+    // Note that we do not check if file is open for reading. Other layers
+    // in the FS stack already do it.        
     return kvs_ReadPartialValue(FILE_NAME(path), buf, size, offset);
 }
 
@@ -587,6 +591,8 @@ int f4r_write(const char *path, const char *buf, size_t size, off_t offset,
         return -EISDIR;
     }
     
+    // Note that we do not check if file is open for writing. Other layers
+    // in the FS stack already do it.        
     return kvs_WritePartialValue( FILE_NAME(path), buf, size, offset);
 }
 
