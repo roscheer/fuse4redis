@@ -3,13 +3,24 @@
 # even the implied warranty of MERCHANTABILITY or FITNESS FOR A
 # PARTICULAR PURPOSE.
 
-FUSE_PARAMS = `pkg-config fuse --cflags` `pkg-config fuse --libs`
-REDIS_PARAMS = `pkg-config hiredis --cflags` `pkg-config hiredis --libs`
+CFLAGS = `pkg-config fuse --cflags` `pkg-config hiredis --cflags`
+LIBS = `pkg-config fuse --libs` `pkg-config hiredis --libs`
 
-all:	fuse4redis.c log.c log.h params.h
-	gcc -Wall -g -O2 -o fuse4redis fuse4redis.c log.c $(FUSE_PARAMS) $(REDIS_PARAMS)
-            
+LIBCUNIT = `pkg-config cunit --libs`
+
+DEPS = log.h params.h
+
+%.o: %.c $(DEPS)
+	gcc -c -o $@ $< $(CFLAGS)
+
+fuse4redis: fuse4redis.o log.o
+	gcc -o $@ $^ $(CFLAGS) $(LIBS)
+
+f4r_test: f4r_test.o
+	gcc -o $@ $^ $(LIBCUNIT)
+
+.PHONY: clean
+
 clean:
-	rm fuse4redis
-                    
+	rm -f fuse4redis *.o *~ core
 
