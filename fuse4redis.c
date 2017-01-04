@@ -129,6 +129,8 @@ int kvs_RenameKey( const char *name, const char *newname)
 {
     redisReply *reply;
 
+    // Some KVS will blindly replace existing keys, wich is the expected FS behaviour
+    // Redis does blindly replace!
     reply = redisCommand(redisCtx,"RENAME %s %s", name, newname);
     if (reply->type == REDIS_REPLY_ERROR) {
         log_msg( "Error result from redis %d\n", reply->type);
@@ -448,12 +450,7 @@ int f4r_rename(const char *path, const char *newpath)
     
     log_msg( "Called rename for path=%s newpath=%s\n", path, newpath);
     
-    // Some KVS may blindly replace existing keys, so we check if pre-exists
-    // Redis does blindly replace!
-    if ( kvs_KeyExists( newname) )
-        return -EEXIST;
-
-    return kvs_RenameKey( filename, newname);
+     return kvs_RenameKey( filename, newname);
 }
 
 /** Create a hard link to a file */
