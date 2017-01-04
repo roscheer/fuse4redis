@@ -247,7 +247,8 @@ int kvs_ReadDirectory( void *buf, fuse_fill_dir_t filler)
    // returns something non-zero.  The first case just means I've
    // read the whole 'redis' directory; the second means the buffer is full.
     if (reply->type == REDIS_REPLY_ARRAY) {
-        for (int j = 0; j < reply->elements; j++) {
+        int j;
+        for ( j = 0; j < reply->elements; j++) {
             log_msg("calling filler with name %s\n", reply->element[j]->str);
             if (filler(buf, reply->element[j]->str, NULL, 0) != 0) {
 	        log_msg("    ERROR f4r_readdir filler:  buffer full");
