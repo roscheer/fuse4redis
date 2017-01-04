@@ -166,25 +166,22 @@ size_t kvs_GetKeyLength( const char *name)
 }
 
 // Extends the value of an existing key (must exist) using null characters.
+// Caller must ensure newsize is larger than current size 
 int kvs_AppendZeroedBytes( const char *name, size_t newsize)
 {
     redisReply *reply;
-    char zbuffer[512] = {0};
-    size_t chunksize;
+    char zbuffer[1] = {0};
     
-    // Extending a key' value is really a corner case, so no concerns about performance
-    while ( newsize > 0) {
-        chunksize = newsize > 512 ? 512 : newsize;
-        reply = redisCommand(redisCtx,"APPEND %s %b", name, zbuffer, 
-                             chunksize);
-        if (reply->type != REDIS_REPLY_INTEGER) {
-            log_msg( "Unexpected result from redis %d\n", reply->type);
-            freeReplyObject(reply);
-            return -EIO;
-        }
+    // Extending a key's value is really a corner case. Take advantage that redis does it
+    // automatically when we set bytes beyond current size
+    reply = redisCommand(redisCtx,"SETRANGE %s %ld %b", name, newsize - 1, zbuffer, 1);
+    if (reply->type != REDIS_REPLY_INTEGER) {
+        log_msg( "Unexpected result from redis %d\n", reply->type);
         freeReplyObject(reply);
-        newsize -= chunksize;
+        return -EIO;
     }
+    freeReplyObject(reply);
+
     return 0;
 }
 
@@ -492,9 +489,11 @@ int f4r_truncate(const char *path, off_t newsize)
         
     if ( ksize == newsize)
         return 0;       // Nothing to be done
-    
+
+    // Documentation says semantics for setting new size beyond current size
+    // is implementation dependent. We will pad the file with null bytes.
     if ( newsize > ksize)
-        return kvs_AppendZeroedBytes( filename, newsize - ksize);
+        return kvs_AppendZeroedBytes( filename, newsize);
     else
         return kvs_TruncateKey( filename, newsize);
 }
