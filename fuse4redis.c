@@ -60,18 +60,19 @@ void kvs_init( const char *hostname, int port)
     struct timeval timeout = { 1, 500000 }; // 1.5 seconds
     
     redisCtx = redisConnectWithTimeout(hostname, port, timeout);
-    if (redisCtx == NULL || redisCtx->err) {
-        if (redisCtx) {
-            printf("Connection error: %s\n", redisCtx->errstr);
-            redisFree(redisCtx);
-        } else {
-            printf("Connection error: can't allocate redis context\n");
-        }
-        exit(1);
+    if (redisCtx == NULL ) {
+        printf("Connection error: can't allocate redis context\n");
+        exit(-1);
+    }
+
+    if ( redisCtx->err) {
+        printf("Connection error: %s\n", redisCtx->errstr);
+        redisFree(redisCtx);
+        exit(-2);
     }
 }
 
-// Connects to redis. Simply aborts if fail.
+// Disconnects from redis. 
 void kvs_Cleanup( void)
 {
     redisFree(redisCtx);
@@ -98,6 +99,7 @@ int kvs_CreateEmptyKey( const char *name)
 int kvs_KeyExists( const char *name)
 {
     redisReply *reply;
+    int exists;
 
     reply = redisCommand(redisCtx,"EXISTS %s", name);
     if (reply->type != REDIS_REPLY_INTEGER) {
@@ -105,8 +107,10 @@ int kvs_KeyExists( const char *name)
         freeReplyObject(reply);
         return -EIO;
     }
+    exists = (int) reply->integer; // 1 if exists, 0 otherwise
+    freeReplyObject(reply);
     
-    return (int) reply->integer;  // 1 if exists, 0 otherwise
+    return exists;  
 }
 
 // Delete key from KVS
@@ -123,6 +127,8 @@ int kvs_DeleteKey( const char *name)
     
     if ( reply->integer == 0)  // 1 if key existed, 0 otherwise
         return -ENOENT;
+    freeReplyObject(reply);
+
     return 0;
 }
 
@@ -139,6 +145,7 @@ int kvs_RenameKey( const char *name, const char *newname)
         freeReplyObject(reply);
         return -ENOENT;
     }
+    freeReplyObject(reply);
     
     return 0;
 }
@@ -237,6 +244,7 @@ int kvs_ReadDirectory( void *buf, fuse_fill_dir_t filler)
     reply = redisCommand(redisCtx,"KEYS *");
     if (reply->type == REDIS_REPLY_ERROR) {
         log_msg( "Failed to communicate with redis\n");
+        freeReplyObject(reply);
         return -EIO;
     }
         
@@ -248,11 +256,11 @@ int kvs_ReadDirectory( void *buf, fuse_fill_dir_t filler)
         for ( j = 0; j < reply->elements; j++) {
             log_msg("calling filler with name %s\n", reply->element[j]->str);
             if (filler(buf, reply->element[j]->str, NULL, 0) != 0) {
-	        log_msg("    ERROR f4r_readdir filler:  buffer full");
+	            log_msg("    ERROR kvs_ReadDirectory filler:  buffer full");
                 freeReplyObject(reply);
-	        return -ENOMEM;
-	    }
-	}
+	            return -ENOMEM;
+	        }
+        }
     }
     freeReplyObject(reply);
     return 0;
@@ -262,6 +270,7 @@ int kvs_ReadDirectory( void *buf, fuse_fill_dir_t filler)
 int kvs_ReadPartialValue(const char *keyname, char *buf, size_t size, off_t offset)
 {
     redisReply *reply;
+    int length;
   
     // Redis has command to get substrings, which is handy!
     reply = redisCommand(redisCtx,"GETRANGE %s %ld %ld", keyname,
@@ -272,9 +281,11 @@ int kvs_ReadPartialValue(const char *keyname, char *buf, size_t size, off_t offs
         return -EIO;
     }
     
-    memcpy( buf, reply->str, reply->len);
-    
-    return reply->len;
+    length = reply->len;
+    memcpy( buf, reply->str, length);
+    freeReplyObject(reply);
+  
+    return length;
 }
 
 // Writes/overwrites the partial contents of a key starting at offset
@@ -294,6 +305,7 @@ int kvs_WritePartialValue(const char *keyname, const char *buf, size_t size, off
         freeReplyObject(reply);
         return -EIO;
     }
+    freeReplyObject(reply);
     
     return size; // Success: return number of bytes written.
 }
