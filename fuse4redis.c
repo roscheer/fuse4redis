@@ -93,7 +93,7 @@ void kvs_Reconnect( const char *hostname, int port)
     }
 
     if ( redisCtx->err != 0) {
-        log_msg( "kvs_Reconnect: Connection error: %s\n", redisCtx->errstr);
+        log_msg( "kvs_Reconnect: Connection error #%d: %s\n", redisCtx->err, redisCtx->errstr);
         redisFree(redisCtx);
         exit(-4);
     }
@@ -113,14 +113,14 @@ int kvs_RedisCommand( redisReply **resultReply, const char *cmd, ...)
     int tries = 0;
 
     while ( tries < 2) {     // This loop retries once if redis connection error
-        va_start(valist, cmd);    // Initialize valist
+        va_start(valist, cmd);    // Initialize valist each time used
         kvsReply = redisvCommand(redisCtx, cmd, valist);
         va_end(valist);     // Clean valist
 
-        if (kvsReply == NULL ) {
+        if (kvsReply == NULL) {
             log_msg( "Error when invoking redis: #%d: %s\n", redisCtx->err, 
                      redisCtx->errstr);
-            log_msg( "Attempting to reconnect\n");
+            log_msg( "Attempting to reconnect once!\n");
             redisFree(redisCtx);
             kvs_Reconnect( hostname, port);   // One retry, as kvs_Reconnect() exits if error
             tries ++;
@@ -129,16 +129,17 @@ int kvs_RedisCommand( redisReply **resultReply, const char *cmd, ...)
     }
     
     if (kvsReply == NULL) {
-        log_msg("kvs_RedisCommand: redis returned error after successful reconnection\n");
+        log_msg("kvs_RedisCommand: ERROR - returned error after successful reconnection\n");
+        log_msg("kvs_RedisCommand: redis error #%d: %s\n", redisCtx->err, redisCtx->errstr);
         exit(-5);
     }
 
     *resultReply = kvsReply;
              
     if ( kvsReply->type == REDIS_REPLY_ERROR) {
-        log_msg( "kvs_RedisCommand: Redis returned error #%d\n", kvsReply->type);
+        log_msg( "kvs_RedisCommand: ERROR - Redis says: %s\n", kvsReply->str);
         freeReplyObject( kvsReply);
-        *resultReply = NULL;    // Releasing it here keeps code a little cleanner
+        *resultReply = NULL;    // Releasing it here upon error keeps code a little cleanner
         return -EIO;
     }
     return 0;
@@ -174,7 +175,8 @@ int kvs_KeyExists( const char *name)
     if (result < 0)
         return result;
     if (reply->type != REDIS_REPLY_INTEGER) {
-        log_msg( "kvs_KeyExists: Unexpected result from redis type=%d\n", reply->type);
+        log_msg( "kvs_KeyExists: ERROR - Unexpected response from redis type=%d\n", 
+                 reply->type);
         freeReplyObject(reply);
         return -EIO;
     }
@@ -194,7 +196,7 @@ int kvs_DeleteKey( const char *name)
     if ( result < 0 )
         return result;
     if (reply->type != REDIS_REPLY_INTEGER) {
-        log_msg( "kvs_DeleteKey: Unexpected result from redis type=%d\n", reply->type);
+        log_msg( "kvs_DeleteKey: ERROR - Unexpected result from redis type=%d\n", reply->type);
         freeReplyObject(reply);
         return -EIO;
     }
@@ -242,7 +244,8 @@ size_t kvs_GetKeyLength( const char *name)
     if ( result < 0)    // redis error
         return result;
     if (reply->type != REDIS_REPLY_INTEGER) {
-        log_msg( "kvs_GetKeyLength: Unexpected result from redis type=%d\n", reply->type);
+        log_msg( "kvs_GetKeyLength: ERROR - Unexpected result from redis type=%d\n", 
+                 reply->type);
         freeReplyObject(reply);
         return -EIO;
     }
@@ -266,7 +269,8 @@ int kvs_AppendZeroedBytes( const char *name, size_t newsize)
         return result;
 
     if (reply->type != REDIS_REPLY_INTEGER) {
-        log_msg( "kvs_AppendZeroedBytes: Unexpected result from redis type=%d\n", reply->type);
+        log_msg( "kvs_AppendZeroedBytes: ERROR - Unexpected result from redis type=%d\n",
+                 reply->type);
         freeReplyObject(reply);
         return -EIO;
     }
@@ -287,7 +291,8 @@ int kvs_TruncateKey( const char *name, size_t newsize)
         if ( result < 0)
             return result;
         if (reply1->type != REDIS_REPLY_STRING) {
-            log_msg( "kvs_TruncateKey: Unexpected result from redis type=%d\n", reply1->type);
+            log_msg( "kvs_TruncateKey: ERROR - Unexpected result from redis type=%d\n", 
+                     reply1->type);
             freeReplyObject(reply1);
             return -EIO;
         }
@@ -335,13 +340,13 @@ int kvs_ReadDirectory( void *buf, fuse_fill_dir_t filler)
         int j;
         for ( j = 0; j < reply->elements; j++) {
             if (filler(buf, reply->element[j]->str, NULL, 0) != 0) {
-	            log_msg("kvs_ReadDirectory: filler returned buffer full\n");
+	            log_msg("kvs_ReadDirectory: ERROR - filler returned buffer full\n");
                 freeReplyObject(reply);
 	            return -ENOMEM;
 	        }
         }
     } else {  // Only array is an acceptable result
-        log_msg( "kvs_ReadDirectory: query did not return a key list, returned type=%d\n",
+        log_msg( "kvs_ReadDirectory: ERROR - query did not return a list, returned type=%d\n",
                  reply->type);
         return -EIO;
     }
@@ -361,7 +366,8 @@ int kvs_ReadPartialValue(const char *keyname, char *buf, size_t size, off_t offs
     if ( result < 0)
         return result;
     if (reply->type != REDIS_REPLY_STRING) {
-        log_msg( "kvs_ReadPartialValue: Unexpected result from redis type=%d\n", reply->type);
+        log_msg( "kvs_ReadPartialValue: ERROR - Unexpected result from redis type=%d\n", 
+                 reply->type);
         freeReplyObject(reply);
         return -EIO;
     }
@@ -391,7 +397,8 @@ int kvs_WritePartialValue(const char *keyname, const char *buf, size_t size, off
         return result;
 
     if (reply->type != REDIS_REPLY_INTEGER) {
-        log_msg( "kvs_WritePartialValue: Unexpected result from redis type=%d\n", reply->type);
+        log_msg( "kvs_WritePartialValue: ERROR - Unexpected result from redis type=%d\n", 
+                 reply->type);
         freeReplyObject(reply);
         return -EIO;
     }
