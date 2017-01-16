@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdarg.h>
 #include <hiredis.h>
 #include <sys/types.h>
 
@@ -51,10 +52,13 @@ redisContext *redisCtx;
 // Ancilary functions to abstract database (KVS) details
 //
 // TODO: Move these functions to a separate source code file
-// TODO: Connection to redis may be lost and a reconnection may fix it.
-//       Replace calls to redisCommand by a local function that retries once.
 
-// Connects to redis. Simply aborts if fail.
+const char *hostname = "127.0.0.1";
+const int port = 6379;
+
+
+// Initial connection to redis upon startup. Simply aborts if it fails.
+//
 void kvs_init( const char *hostname, int port)
 {
     struct timeval timeout = { 1, 500000 }; // 1.5 seconds
@@ -72,6 +76,74 @@ void kvs_init( const char *hostname, int port)
     }
 }
 
+// Reconnects to redis. Simply aborts if fail. Logs errors in logfile.
+// NOTE: while we could choose not to abort if we cannot reconnect, we would flood 
+// the logs with error messages as the FS continues to be used, so we chose to retry 
+// only once and require that the system admin (or the user) restart fuse4redis in 
+// case redis was out for longer than a short while. 
+//
+void kvs_Reconnect( const char *hostname, int port)
+{
+    struct timeval timeout = { 1, 500000 }; // 1.5 seconds
+    
+    redisCtx = redisConnectWithTimeout(hostname, port, timeout);
+    if (redisCtx == NULL ) {
+        log_msg("kvs_Reconnect: Connection error: can't allocate redis context\n");
+        exit(-3);
+    }
+
+    if ( redisCtx->err != 0) {
+        log_msg( "kvs_Reconnect: Connection error: %s\n", redisCtx->errstr);
+        redisFree(redisCtx);
+        exit(-4);
+    }
+}
+
+
+// Connection to redis may be lost and a reconnection may fix it.
+// Instead of calling redisCommand throughout the code and handling this 
+// on every call, we will wrap redisCommand and provide better error handling
+// in one single place, maintaining the rest of the code cleanner.
+// Guarantees that resultReply in non-NULL upon successfull return.
+
+int kvs_RedisCommand( redisReply **resultReply, const char *cmd, ...)
+{
+    va_list valist;
+    redisReply *kvsReply;
+    int tries = 0;
+
+    while ( tries < 2) {     // This loop retries once if redis connection error
+        va_start(valist, cmd);    // Initialize valist
+        kvsReply = redisvCommand(redisCtx, cmd, valist);
+        va_end(valist);     // Clean valist
+
+        if (kvsReply == NULL ) {
+            log_msg( "Error when invoking redis: #%d: %s\n", redisCtx->err, 
+                     redisCtx->errstr);
+            log_msg( "Attempting to reconnect\n");
+            redisFree(redisCtx);
+            kvs_Reconnect( hostname, port);   // One retry, as kvs_Reconnect() exits if error
+            tries ++;
+        } else
+            break;
+    }
+    
+    if (kvsReply == NULL) {
+        log_msg("kvs_RedisCommand: redis returned error after successful reconnection\n");
+        exit(-5);
+    }
+
+    *resultReply = kvsReply;
+             
+    if ( kvsReply->type == REDIS_REPLY_ERROR) {
+        log_msg( "kvs_RedisCommand: Redis returned error #%d\n", kvsReply->type);
+        freeReplyObject( kvsReply);
+        *resultReply = NULL;    // Releasing it here keeps code a little cleanner
+        return -EIO;
+    }
+    return 0;
+}
+
 // Disconnects from redis. 
 void kvs_Cleanup( void)
 {
@@ -82,16 +154,13 @@ void kvs_Cleanup( void)
 int kvs_CreateEmptyKey( const char *name)
 {
     redisReply *reply;
+    int result;
     
-    reply = redisCommand(redisCtx,"SET %s %s", name, "");
-    if (reply->type == REDIS_REPLY_ERROR) {
-        log_msg( "Unexpected result from redis %d\n", reply->type);
-        freeReplyObject(reply);
-        return -EIO;
-    }
+    result = kvs_RedisCommand( &reply, "SET %s %s", name, "");
 
-    freeReplyObject(reply);
-    return 0;
+    if (result >= 0) 
+        freeReplyObject(reply);
+    return result;
 }
 
 
@@ -99,11 +168,13 @@ int kvs_CreateEmptyKey( const char *name)
 int kvs_KeyExists( const char *name)
 {
     redisReply *reply;
-    int exists;
+    int exists, result;
 
-    reply = redisCommand(redisCtx,"EXISTS %s", name);
+    result = kvs_RedisCommand( &reply, "EXISTS %s", name);
+    if (result < 0)
+        return result;
     if (reply->type != REDIS_REPLY_INTEGER) {
-        log_msg( "Unexpected result from redis %d\n", reply->type);
+        log_msg( "kvs_KeyExists: Unexpected result from redis type=%d\n", reply->type);
         freeReplyObject(reply);
         return -EIO;
     }
@@ -117,10 +188,13 @@ int kvs_KeyExists( const char *name)
 int kvs_DeleteKey( const char *name)
 {
     redisReply *reply;
+    int result;
 
-    reply = redisCommand(redisCtx,"DEL %s", name);
+    result = kvs_RedisCommand( &reply, "DEL %s", name);
+    if ( result < 0 )
+        return result;
     if (reply->type != REDIS_REPLY_INTEGER) {
-        log_msg( "Unexpected result from redis %d\n", reply->type);
+        log_msg( "kvs_DeleteKey: Unexpected result from redis type=%d\n", reply->type);
         freeReplyObject(reply);
         return -EIO;
     }
@@ -136,15 +210,14 @@ int kvs_DeleteKey( const char *name)
 int kvs_RenameKey( const char *name, const char *newname)
 {
     redisReply *reply;
+    int result;
 
     // Some KVS will blindly replace existing keys, wich is the expected FS behaviour
     // Redis does blindly replace!
-    reply = redisCommand(redisCtx,"RENAME %s %s", name, newname);
-    if (reply->type == REDIS_REPLY_ERROR) {
-        log_msg( "Error result from redis %d\n", reply->type);
-        freeReplyObject(reply);
-        return -ENOENT;
-    }
+    result = kvs_RedisCommand( &reply, "RENAME %s %s", name, newname);
+    if ( result < 0)
+        return result; 
+
     freeReplyObject(reply);
     
     return 0;
@@ -156,14 +229,20 @@ size_t kvs_GetKeyLength( const char *name)
 {
     redisReply *reply;
     size_t ksize;
+    int result;
     
-    // Redis return length 0 for nonexisting keys, so explicitly check
-    if ( ! kvs_KeyExists( name))
+    // Redis returns length 0 for nonexisting keys, so explicitly check
+    result = kvs_KeyExists( name);
+    if ( result < 0)    // redis error
+        return result;
+    if ( result == 0)
         return -ENOENT;
         
-    reply = redisCommand(redisCtx,"STRLEN %s", name);
+    result = kvs_RedisCommand( &reply, "STRLEN %s", name);
+    if ( result < 0)    // redis error
+        return result;
     if (reply->type != REDIS_REPLY_INTEGER) {
-        log_msg( "Unexpected result from redis %d\n", reply->type);
+        log_msg( "kvs_GetKeyLength: Unexpected result from redis type=%d\n", reply->type);
         freeReplyObject(reply);
         return -EIO;
     }
@@ -178,12 +257,16 @@ int kvs_AppendZeroedBytes( const char *name, size_t newsize)
 {
     redisReply *reply;
     char zbuffer[1] = {0};
+    int result;
     
     // Extending a key's value is really a corner case. Take advantage that redis does it
     // automatically when we set bytes beyond current size
-    reply = redisCommand(redisCtx,"SETRANGE %s %ld %b", name, newsize - 1, zbuffer, 1);
+    result = kvs_RedisCommand( &reply, "SETRANGE %s %ld %b", name, newsize - 1, zbuffer, 1);
+    if ( result < 0)    // redis error
+        return result;
+
     if (reply->type != REDIS_REPLY_INTEGER) {
-        log_msg( "Unexpected result from redis %d\n", reply->type);
+        log_msg( "kvs_AppendZeroedBytes: Unexpected result from redis type=%d\n", reply->type);
         freeReplyObject(reply);
         return -EIO;
     }
@@ -197,25 +280,24 @@ int kvs_TruncateKey( const char *name, size_t newsize)
 {
     redisReply *reply1 = NULL,
                *reply2;
-    int result = 0;
+    int result;
 
     if ( newsize > 0 ) {    // Need to preserve beginning of value 
-        reply1 = redisCommand(redisCtx,"GETRANGE %s %ld %ld", name, (size_t)0, newsize);
+        result = kvs_RedisCommand( &reply1,"GETRANGE %s %ld %ld", name, (size_t)0, newsize);
+        if ( result < 0)
+            return result;
         if (reply1->type != REDIS_REPLY_STRING) {
-            log_msg( "Unexpected result from redis %d\n", reply1->type);
+            log_msg( "kvs_TruncateKey: Unexpected result from redis type=%d\n", reply1->type);
             freeReplyObject(reply1);
             return -EIO;
         }
     }
-    reply2 = redisCommand( redisCtx, "SET %s %b", name, 
+    result = kvs_RedisCommand( &reply2, "SET %s %b", name, 
                            newsize > 0 ? reply1->str : "", newsize);
-    if ( reply2->type == REDIS_REPLY_ERROR) {
-        log_msg( "Error result from redis %d\n", reply2->type);
-        result = -EIO;
-    }
     if ( reply1 != NULL)
         freeReplyObject(reply1);
-    freeReplyObject(reply2);
+    if ( result >= 0)
+        freeReplyObject(reply2);
     return result;
 }
 
@@ -240,13 +322,11 @@ int kvs_TruncateKey( const char *name, size_t newsize)
 int kvs_ReadDirectory( void *buf, fuse_fill_dir_t filler)
 {
     redisReply *reply;
+    int result;
       
-    reply = redisCommand(redisCtx,"KEYS *");
-    if (reply->type == REDIS_REPLY_ERROR) {
-        log_msg( "Failed to communicate with redis\n");
-        freeReplyObject(reply);
-        return -EIO;
-    }
+    result = kvs_RedisCommand( &reply, "KEYS *");
+    if ( result < 0)
+        return result;
         
    // The loop below exits when either all keys were copied, or filler()
    // returns something non-zero.  The first case just means I've
@@ -254,13 +334,16 @@ int kvs_ReadDirectory( void *buf, fuse_fill_dir_t filler)
     if (reply->type == REDIS_REPLY_ARRAY) {
         int j;
         for ( j = 0; j < reply->elements; j++) {
-            log_msg("calling filler with name %s\n", reply->element[j]->str);
             if (filler(buf, reply->element[j]->str, NULL, 0) != 0) {
-	            log_msg("    ERROR kvs_ReadDirectory filler:  buffer full");
+	            log_msg("kvs_ReadDirectory: filler returned buffer full\n");
                 freeReplyObject(reply);
 	            return -ENOMEM;
 	        }
         }
+    } else {  // Only array is an acceptable result
+        log_msg( "kvs_ReadDirectory: query did not return a key list, returned type=%d\n",
+                 reply->type);
+        return -EIO;
     }
     freeReplyObject(reply);
     return 0;
@@ -270,13 +353,15 @@ int kvs_ReadDirectory( void *buf, fuse_fill_dir_t filler)
 int kvs_ReadPartialValue(const char *keyname, char *buf, size_t size, off_t offset)
 {
     redisReply *reply;
-    int length;
+    int length, result;
   
     // Redis has command to get substrings, which is handy!
-    reply = redisCommand(redisCtx,"GETRANGE %s %ld %ld", keyname,
+    result = kvs_RedisCommand(&reply,"GETRANGE %s %ld %ld", keyname,
                          offset, offset + size - 1);  // Assuming size will never be 0
+    if ( result < 0)
+        return result;
     if (reply->type != REDIS_REPLY_STRING) {
-        log_msg( "Unexpected result from redis %d\n", reply->type);
+        log_msg( "kvs_ReadPartialValue: Unexpected result from redis type=%d\n", reply->type);
         freeReplyObject(reply);
         return -EIO;
     }
@@ -292,24 +377,29 @@ int kvs_ReadPartialValue(const char *keyname, char *buf, size_t size, off_t offs
 int kvs_WritePartialValue(const char *keyname, const char *buf, size_t size, off_t offset)
 {
     redisReply *reply;
+    int result;
   
     // Redis has a command to write partial values of keys, which is handy!
     // Impressively, redis handles writes beyond the current length as expected, 
     // including filling with zeroes when offset is beyond current length. In a nutshell,
     // it already implements the same semantics a the write call in Linux. Nice!!!
-    reply = redisCommand(redisCtx,"SETRANGE %s %ld %b", keyname,
+    // But beware, different from write, redis returns the resulting total length of 
+    // the new key.
+    result = kvs_RedisCommand(&reply,"SETRANGE %s %ld %b", keyname,
                          offset, buf, size);
-    // However, different from write, redis returns the resulting total length of the key.
+    if ( result < 0)
+        return result;
+
     if (reply->type != REDIS_REPLY_INTEGER) {
-        log_msg( "Unexpected result from redis %d\n", reply->type);
+        log_msg( "kvs_WritePartialValue: Unexpected result from redis type=%d\n", reply->type);
         freeReplyObject(reply);
         return -EIO;
     }
     freeReplyObject(reply);
     
-    return size; // Success: return number of bytes written.
+    return size; // Success: return number of bytes in buf actually written.
 }
-
+//////
 
 //
 // End of section that abstracts database (KVS) details
@@ -334,7 +424,7 @@ int f4r_getattr(const char *path, struct stat *statbuf)
     size_t fsize = 0;
     const char *filename = FILE_NAME(path);
     
-    log_msg( "Called getattr for path=%s\n", path);
+    log_msg( "f4r_getattr: Called for path=%s\n", path);
     
     statbuf->st_mode = S_IRWXU | S_IRWXG | S_IRWXO;
     if (strcmp(path, "/") == 0) {   // Atributes for the FS' root dir
@@ -354,7 +444,6 @@ int f4r_getattr(const char *path, struct stat *statbuf)
         fsize = kvs_GetKeyLength( filename);
         if ( fsize < 0 )
             return -EIO;
-        log_msg( "File size is %ld\n", fsize);
     }
     statbuf->st_size = fsize;
     statbuf->st_uid = getuid();
@@ -378,7 +467,7 @@ int f4r_getattr(const char *path, struct stat *statbuf)
 // f4r_readlink() code by Bernardo F Costa (thanks!)
 int f4r_readlink(const char *path, char *link, size_t size)
 {
-    log_msg( "Called readlink for path=%s\n", path);
+    log_msg( "f4r_readlink: Called for path=%s\n", path);
     
     return -ENOSYS;     // Not supported
 }
@@ -392,7 +481,7 @@ int f4r_mknod(const char *path, mode_t mode, dev_t dev)
 {
     const char *filename = FILE_NAME(path);
     
-    log_msg( "Called mknod for path=%s\n", path);
+    log_msg( "f4r_mknod: Called for path=%s\n", path);
     
     if ( ! S_ISREG(mode)) // fuse4redis only support regular file creation
         return -EINVAL;
@@ -418,14 +507,14 @@ int f4r_mknod(const char *path, mode_t mode, dev_t dev)
 /** Create a directory */
 int f4r_mkdir(const char *path, mode_t mode)
 {
-    log_msg( "Called mkdir for path=%s\n", path);
+    log_msg( "f4r_mkdir: Called for path=%s\n", path);
     return -ENOSYS;
 }
 
 /** Remove a file */
 int f4r_unlink(const char *path)
 {    
-    log_msg( "Called unlink for path=%s\n", path);
+    log_msg( "f4r_unlink: Called for path=%s\n", path);
 
     if (strcmp(path, "/") == 0) {   // Trying to delete the FS' root dir
         return -EISDIR;
@@ -437,7 +526,7 @@ int f4r_unlink(const char *path)
 /** Remove a directory */
 int f4r_rmdir(const char *path)
 {
-    log_msg( "Called rmdir for path=%s\n", path);
+    log_msg( "f4r_rmdir: Called for path=%s\n", path);
 
     return -ENOSYS;
 }
@@ -448,7 +537,7 @@ int f4r_rmdir(const char *path)
 // to the symlink() system call.
 int f4r_symlink(const char *path, const char *link)
 {
-    log_msg( "Called symlink for path=%s\n", path);
+    log_msg( "f4r_symlink: Called for path=%s\n", path);
     
     return -ENOSYS;
 }
@@ -460,7 +549,7 @@ int f4r_rename(const char *path, const char *newpath)
     const char *filename = FILE_NAME(path),
                *newname = FILE_NAME(newpath);
     
-    log_msg( "Called rename for path=%s newpath=%s\n", path, newpath);
+    log_msg( "f4r_rename: Called for path=%s newpath=%s\n", path, newpath);
     
      return kvs_RenameKey( filename, newname);
 }
@@ -468,7 +557,7 @@ int f4r_rename(const char *path, const char *newpath)
 /** Create a hard link to a file */
 int f4r_link(const char *path, const char *newpath)
 {
-    log_msg( "Called link for path=%s\n", path);
+    log_msg( "f4r_link: Called for path=%s\n", path);
     
     return -ENOSYS;
 }
@@ -476,14 +565,14 @@ int f4r_link(const char *path, const char *newpath)
 /** Change the permission bits of a file */
 int f4r_chmod(const char *path, mode_t mode)
 {
-    log_msg( "Called chmod for path=%s\n", path);
+    log_msg( "f4r_chmod: Called for path=%s\n", path);
     return -ENOSYS;
 }
 
 /** Change the owner and group of a file */
 int f4r_chown(const char *path, uid_t uid, gid_t gid)
 {
-    log_msg( "Called chown for path=%s\n", path);
+    log_msg( "f4r_chown: Called for path=%s\n", path);
     return -ENOSYS;
 }
 
@@ -493,7 +582,7 @@ int f4r_truncate(const char *path, off_t newsize)
     size_t ksize;
     const char *filename = FILE_NAME( path);
     
-    log_msg( "Called truncate for path=%s\n", path);
+    log_msg( "f4r_truncate: Called for path=%s\n", path);
     
     ksize = kvs_GetKeyLength( filename);
     if ( ksize < 0)
@@ -513,7 +602,7 @@ int f4r_truncate(const char *path, off_t newsize)
 /** Change the access and/or modification times of a file */
 int f4r_utime(const char *path, struct utimbuf *ubuf)
 {
-    log_msg( "Called utime for path=%s\n", path);
+    log_msg( "f4r_utime: Called for path=%s\n", path);
     return -ENOSYS;
 }
 
@@ -532,7 +621,7 @@ int f4r_open(const char *path, struct fuse_file_info *fi)
     int exists;
     const char *filename = FILE_NAME( path);
     
-    log_msg( "Called open for path=%s\n", path);
+    log_msg( "f4r_open: Called for path=%s\n", path);
     
     if (strcmp(path, "/") == 0) {   // Trying to open the FS' root dir
         return -EISDIR;
@@ -575,7 +664,7 @@ int f4r_open(const char *path, struct fuse_file_info *fi)
  */
 int f4r_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-    log_msg( "Called read for path=%s\n", path);
+    log_msg( "f4r_read: Called for path=%s\n", path);
     
     if (strcmp(path, "/") == 0) {   // Trying to read the FS' root dir
         return -EISDIR;
@@ -597,7 +686,7 @@ int f4r_read(const char *path, char *buf, size_t size, off_t offset, struct fuse
 int f4r_write(const char *path, const char *buf, size_t size, off_t offset,
 	     struct fuse_file_info *fi)
 {
-    log_msg( "Called writefor path=%s\n", path);
+    log_msg( "f4r_write: Called path=%s\n", path);
 
     if (strcmp(path, "/") == 0) {   // Trying to read the FS' root dir
         return -EISDIR;
@@ -617,7 +706,7 @@ int f4r_write(const char *path, const char *buf, size_t size, off_t offset,
  */
 int f4r_statfs(const char *path, struct statvfs *statv)
 {
-    log_msg( "Called statfs for path=%s\n", path);
+    log_msg( "f4r_statfs: Called for path=%s\n", path);
     return -ENOSYS;
 }
 
@@ -646,7 +735,7 @@ int f4r_statfs(const char *path, struct statvfs *statv)
  */
 int f4r_flush(const char *path, struct fuse_file_info *fi)
 {
-    log_msg( "Called flushfor path=%s\n", path);
+    log_msg( "f4r_flush: Called path=%s\n", path);
     
     return 0;   // No op. Nothing to flush to KVS.
 }
@@ -667,7 +756,7 @@ int f4r_flush(const char *path, struct fuse_file_info *fi)
  */
 int f4r_release(const char *path, struct fuse_file_info *fi)
 {
-    log_msg( "Called release for path=%s\n", path);
+    log_msg( "f4r_release: Called for path=%s\n", path);
 
     // We do not keep any file related state and do not use handles. Nothing to do here!
     return 0;
@@ -682,7 +771,7 @@ int f4r_release(const char *path, struct fuse_file_info *fi)
  */
 int f4r_fsync(const char *path, int datasync, struct fuse_file_info *fi)
 {
-    log_msg( "Called fsync for path=%s\n", path);
+    log_msg( "f4r_fsync: Called for path=%s\n", path);
     return 0;
 }
 
@@ -690,28 +779,28 @@ int f4r_fsync(const char *path, int datasync, struct fuse_file_info *fi)
 /** Set extended attributes */
 int f4r_setxattr(const char *path, const char *name, const char *value, size_t size, int flags)
 {
-    log_msg( "Called setxattr for path=%s\n", path);
+    log_msg( "f4r_setxattr: Called for path=%s\n", path);
     return -ENOSYS;
 }
 
 /** Get extended attributes */
 int f4r_getxattr(const char *path, const char *name, char *value, size_t size)
 {
-    log_msg( "Called getxattr for path=%s\n", path);
+    log_msg( "f4r_getxattr: Called for path=%s\n", path);
     return -ENOSYS;
 }
 
 /** List extended attributes */
 int f4r_listxattr(const char *path, char *list, size_t size)
 {
-    log_msg( "Called listxattr for path=%s\n", path);
+    log_msg( "f4r_listxattr: Called for path=%s\n", path);
     return -ENOSYS;
 }
 
 /** Remove extended attributes */
 int f4r_removexattr(const char *path, const char *name)
 {
-    log_msg( "Called removexattr for path=%s\n", path);
+    log_msg( "f4r_removexattr: Called for path=%s\n", path);
     return -ENOSYS;
 }
 #endif
@@ -725,7 +814,7 @@ int f4r_removexattr(const char *path, const char *name)
  */
 int f4r_opendir(const char *path, struct fuse_file_info *fi)
 {
-    log_msg( "Called opendir for path=%s\n", path);
+    log_msg( "f4r_opendir: Called for path=%s\n", path);
     
     if (strcmp(path, "/") != 0) {   // Trying to open dir other than FS' root dir
         return -ENOTDIR;
@@ -760,7 +849,7 @@ int f4r_opendir(const char *path, struct fuse_file_info *fi)
 int f4r_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
 	       struct fuse_file_info *fi)
 {
-    log_msg( "Called readdir for path=%s\n", path);
+    log_msg( "f4r_readdir: Called for path=%s\n", path);
     
     if (strcmp(path, "/") != 0)   // Only the FS' root dir is currently allowed
         return -ENOTDIR;
@@ -774,7 +863,7 @@ int f4r_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offse
  */
 int f4r_releasedir(const char *path, struct fuse_file_info *fi)
 {
-    log_msg( "Called releasedir for path=%s\n", path);
+    log_msg( "f4r_releasedir: Called for path=%s\n", path);
     
     // We do not keep any oopen directory related state. Nothing to do here!
     return 0;
@@ -791,7 +880,7 @@ int f4r_releasedir(const char *path, struct fuse_file_info *fi)
 // happens to be a directory? ??? >>> I need to implement this...
 int f4r_fsyncdir(const char *path, int datasync, struct fuse_file_info *fi)
 {
-    log_msg( "Called fsyncdir for path=%s\n", path);
+    log_msg( "f4r_fsyncdir: Called for path=%s\n", path);
     return 0;
 }
 
@@ -814,7 +903,7 @@ int f4r_fsyncdir(const char *path, int datasync, struct fuse_file_info *fi)
 // FUSE).
 void *f4r_init(struct fuse_conn_info *conn)
 {
-    log_msg( "Called init\n");
+    log_msg( "f4r_init: Called init. FUSE is initializing!\n");
     
     return F4R_DATA;
 }
@@ -828,7 +917,7 @@ void *f4r_init(struct fuse_conn_info *conn)
  */
 void f4r_destroy(void *userdata)
 {
-    log_msg( "Called destroy (a.k.a. cleanup)\n");
+    log_msg( "f4r_destroy: Called cleanup operation.\n");
     
     kvs_Cleanup();
 }
@@ -846,7 +935,7 @@ void f4r_destroy(void *userdata)
  */
 int f4r_access(const char *path, int mask)
 {
-    log_msg( "Called access for path=%s mask=%d\n", path, mask);
+    log_msg( "f4r_access: Called for path=%s with mask=%d\n", path, mask);
     return 0;
 }
 
@@ -879,7 +968,7 @@ int f4r_access(const char *path, int mask)
  */
 int f4r_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi)
 {
-    log_msg( "Called ftruncate for path=%s\n", path);
+    log_msg( "f4r_ftruncate: Called for path=%s\n", path);
     
     // Since we have the path and do not use handles, ftruncate and truncate are equal
     return f4r_truncate( FILE_NAME( path), offset);
@@ -899,7 +988,7 @@ int f4r_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi)
  */
 int f4r_fgetattr(const char *path, struct stat *statbuf, struct fuse_file_info *fi)
 {
-    log_msg( "Called fgetattr for path=%s\n", path);
+    log_msg( "f4r_fgetattr: Called for path=%s\n", path);
 
     // Since we do not keep file handles, we simply delegate to f4r_getattr()
     return f4r_getattr( FILE_NAME( path), statbuf);
@@ -951,8 +1040,6 @@ struct fuse_operations f4r_oper = {
 
 int main(int argc, char *argv[])
 {
-    const char *hostname = "127.0.0.1";
-    int port = 6379;
     int fuse_stat;
     struct f4r_state *f4r_data;
 
