@@ -178,7 +178,7 @@ int kvs_KeyExists( const char *name)
         log_msg( "kvs_KeyExists: ERROR - Unexpected response from redis type=%d\n", 
                  reply->type);
         freeReplyObject(reply);
-        return -EIO;
+        return -EPROTO;
     }
     exists = (int) reply->integer; // 1 if exists, 0 otherwise
     freeReplyObject(reply);
@@ -198,7 +198,7 @@ int kvs_DeleteKey( const char *name)
     if (reply->type != REDIS_REPLY_INTEGER) {
         log_msg( "kvs_DeleteKey: ERROR - Unexpected result from redis type=%d\n", reply->type);
         freeReplyObject(reply);
-        return -EIO;
+        return -EPROTO;
     }
     
     if ( reply->integer == 0)  // 1 if key existed, 0 otherwise
@@ -247,7 +247,7 @@ size_t kvs_GetKeyLength( const char *name)
         log_msg( "kvs_GetKeyLength: ERROR - Unexpected result from redis type=%d\n", 
                  reply->type);
         freeReplyObject(reply);
-        return -EIO;
+        return -EPROTO;
     }
     ksize = (size_t)reply->integer;
     freeReplyObject(reply);
@@ -272,7 +272,7 @@ int kvs_AppendZeroedBytes( const char *name, size_t newsize)
         log_msg( "kvs_AppendZeroedBytes: ERROR - Unexpected result from redis type=%d\n",
                  reply->type);
         freeReplyObject(reply);
-        return -EIO;
+        return -EPROTO;
     }
     freeReplyObject(reply);
 
@@ -294,7 +294,7 @@ int kvs_TruncateKey( const char *name, size_t newsize)
             log_msg( "kvs_TruncateKey: ERROR - Unexpected result from redis type=%d\n", 
                      reply1->type);
             freeReplyObject(reply1);
-            return -EIO;
+            return -EPROTO;
         }
     }
     result = kvs_RedisCommand( &reply2, "SET %s %b", name, 
@@ -348,7 +348,7 @@ int kvs_ReadDirectory( void *buf, fuse_fill_dir_t filler)
     } else {  // Only array is an acceptable result
         log_msg( "kvs_ReadDirectory: ERROR - query did not return a list, returned type=%d\n",
                  reply->type);
-        return -EIO;
+        return -EPROTO;
     }
     freeReplyObject(reply);
     return 0;
@@ -369,7 +369,7 @@ int kvs_ReadPartialValue(const char *keyname, char *buf, size_t size, off_t offs
         log_msg( "kvs_ReadPartialValue: ERROR - Unexpected result from redis type=%d\n", 
                  reply->type);
         freeReplyObject(reply);
-        return -EIO;
+        return -EPROTO;
     }
     
     length = reply->len;
@@ -400,7 +400,7 @@ int kvs_WritePartialValue(const char *keyname, const char *buf, size_t size, off
         log_msg( "kvs_WritePartialValue: ERROR - Unexpected result from redis type=%d\n", 
                  reply->type);
         freeReplyObject(reply);
-        return -EIO;
+        return -EPROTO;
     }
     freeReplyObject(reply);
     
@@ -442,7 +442,7 @@ int f4r_getattr(const char *path, struct stat *statbuf)
         int exists = kvs_KeyExists( filename);
         
         if (exists < 0 )
-            return -EIO;
+            return exists;
 
         if ( ! exists)   // Key does not exist
             return -ENOENT;
@@ -450,7 +450,7 @@ int f4r_getattr(const char *path, struct stat *statbuf)
         statbuf->st_mode = statbuf->st_mode | S_IFREG;
         fsize = kvs_GetKeyLength( filename);
         if ( fsize < 0 )
-            return -EIO;
+            return fsize;
     }
     statbuf->st_size = fsize;
     statbuf->st_uid = getuid();
@@ -487,6 +487,7 @@ int f4r_readlink(const char *path, char *link, size_t size)
 int f4r_mknod(const char *path, mode_t mode, dev_t dev)
 {
     const char *filename = FILE_NAME(path);
+    int result;
     
     log_msg( "f4r_mknod: Called for path=%s\n", path);
     
@@ -498,15 +499,16 @@ int f4r_mknod(const char *path, mode_t mode, dev_t dev)
         int exists = kvs_KeyExists( filename);
         
         if (exists < 0)
-            return -EIO;
+            return exists;
 
         if ( exists)
             return -EEXIST;
     }
     
     // Create an empty redis key to represent an empty file
-    if (kvs_CreateEmptyKey( filename) < 0)
-        return -EIO;
+    result = kvs_CreateEmptyKey( filename);
+    if ( result < 0)
+        return result;
  
     return 0;
 }
@@ -625,7 +627,7 @@ int f4r_utime(const char *path, struct utimbuf *ubuf)
  */
 int f4r_open(const char *path, struct fuse_file_info *fi)
 {
-    int exists;
+    int exists, result;
     const char *filename = FILE_NAME( path);
     
     log_msg( "f4r_open: Called for path=%s\n", path);
@@ -636,24 +638,24 @@ int f4r_open(const char *path, struct fuse_file_info *fi)
     
     exists = kvs_KeyExists( filename);
     if ( exists < 0)
-        return -EIO;
+        return exists;
 
     if ( ! exists) {
         if( fi->flags & O_CREAT) {
             // Create an empty redis key to represent an empty file
-            if (kvs_CreateEmptyKey( filename) < 0)
-                return -EIO;
+            result = kvs_CreateEmptyKey( filename);
+            if ( result < 0)
+                return result;
         } else        
             return -ENOENT;
     } else {
         if( fi->flags & O_TRUNC) {
             // Empty the file, if existing
-            if (kvs_TruncateKey( filename, 0) < 0)
-                return -EIO;
+            result = kvs_TruncateKey( filename, 0);
+            if ( result < 0)
+                return result;
         }
     }
-
-    
 
     return 0;
 }
